@@ -120,10 +120,10 @@
 ## Phase 8: CLI & Ecosystem
 
 ```
+[x] 8.4 Python DB-API 2.0 (connect, cursor, execute, fetch) — Database class
 [ ] 8.1 CLI REPL (prompt, multi-line, history)
 [ ] 8.2 Dot commands (.tables, .schema, .dump, .import, etc.)
 [ ] 8.3 Output modes (list, column, csv, json, markdown, box, insert)
-[ ] 8.4 Python DB-API 2.0 (connect, cursor, execute, fetch)
 [ ] 8.5 Parameter binding (?, :name, @name, $name)
 [ ] 8.6 Custom function/aggregate/collation registration
 ```
