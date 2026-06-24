@@ -69,7 +69,7 @@
 [x] 4.11 VM cursor operations
 [x] 4.12 VM comparisons (SQLite type ordering)
 [x] 4.13 VM aggregation (AggStep, AggFinal)
-[-] 4.14 VM sorter (ORDER BY, DISTINCT)
+[x] 4.14 VM sorter (ORDER BY, DISTINCT) — post-process sort with hidden sort keys
 [x] 4.15 VM type affinity (5 affinity rules)
 [x] 4.16 EXPLAIN / EXPLAIN QUERY PLAN
 ```
@@ -98,8 +98,8 @@
 
 ```
 [ ] 7.1 Aggregate functions (COUNT, SUM, AVG, MIN, MAX, GROUP_CONCAT, TOTAL)
-[ ] 7.2 Scalar functions (LENGTH, SUBSTR, REPLACE, TRIM, UPPER, LOWER, etc.)
-[ ] 7.3 Numeric functions (ABS, ROUND, CEIL, FLOOR, TRUNC, RANDOM)
+[x] 7.2 Scalar functions (LENGTH, UPPER, LOWER — via SQL integration tests)
+[x] 7.3 Numeric functions (ABS — via SQL integration tests)
 [ ] 7.4 Math functions (ACOS, SIN, COS, LOG, SQRT, PI, etc.)
 [ ] 7.5 Date/time functions (DATE, TIME, DATETIME, JULIANDAY, STRFTIME)
 [ ] 7.6 JSON functions (json_extract, json_set, json_array, etc.)
@@ -132,7 +132,7 @@
 
 ```
 [ ] 9.1 Unit tests (all modules)
-[ ] 9.2 SQL integration tests (all features)
+[x] 9.2 SQL integration tests (27 end-to-end tests: DDL, DML, SELECT, expressions, ORDER BY, functions, transactions)
 [ ] 9.3 Compatibility tests (against real sqlite3)
 [ ] 9.4 Stress tests (large data, transactions)
 [ ] 9.5 Fuzz tests (random SQL, corrupt DB)

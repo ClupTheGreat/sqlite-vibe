@@ -14,11 +14,13 @@ class Database:
         from pysqlite.vfs import OSVFS, MemoryVFS
         from pysqlite.pager import Pager
         from pysqlite.schema import Schema
+        from pysqlite.transaction import TransactionManager
 
         self.vfs = MemoryVFS() if path == ':memory:' else OSVFS()
         self.pager = Pager(self.vfs, path)
         self.schema = Schema(self.pager)
         self.schema.load()
+        self.tx = TransactionManager(self.pager, self.vfs, self.pager.handle)
 
     def execute(self, sql: str):
         from pysqlite.lexer import Lexer
@@ -35,11 +37,12 @@ class Database:
         for stmt in statements:
             compiler = Compiler(self.schema, self.pager)
             program = compiler.compile(stmt)
-            vm = VM(self.pager)
+            vm = VM(self.pager, self.tx)
             rows = vm.run(program)
             results.append(rows)
 
         return results if len(results) != 1 else results[0]
 
     def close(self):
-        self.pager.vfs.close(self.pager.handle)
+        if self.pager.handle:
+            self.pager.vfs.close(self.pager.handle)

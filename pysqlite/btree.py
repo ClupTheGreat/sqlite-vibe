@@ -31,6 +31,14 @@ class BTreePage:
         self.raw_data = bytearray(pager.read_page(page_number))
         self.dirty = False
         self._parse_header()
+        if self.page_type == 0:
+            off = self.b_tree_offset
+            self.raw_data[off + 0] = 0x0D  # PT_LEAF_TABLE
+            self.raw_data[off + 1:off + 3] = (0).to_bytes(2, 'big')  # first_freeblock
+            self.raw_data[off + 3:off + 5] = (0).to_bytes(2, 'big')  # cell_count
+            self.raw_data[off + 5:off + 7] = self.pager.page_size.to_bytes(2, 'big')  # cell_content_offset
+            self.raw_data[off + 7] = 0  # fragmented_free_bytes
+            self._parse_header()
         self._parse_cell_pointers()
 
     @property

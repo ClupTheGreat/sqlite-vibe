@@ -129,6 +129,10 @@ class Compiler:
         self.reg_zero = self.alloc_reg()
         self.reg_one = self.alloc_reg()
         self.reg_null = self.alloc_reg()
+        self.cursor_table: dict[int, TableDef] = {}
+        self.emit(Opcode.Integer, P1=0, P2=self.reg_zero, comment='const 0')
+        self.emit(Opcode.Integer, P1=1, P2=self.reg_one, comment='const 1')
+        self.emit(Opcode.Null, P1=self.reg_null, comment='const null')
 
         if isinstance(statement, Select):
             self._compile_select(statement)
@@ -202,8 +206,8 @@ class Compiler:
             operand_reg = self.compile_expr(expr.operand, cursor)
             op = expr.op
             if op == '-':
-                self.emit(Opcode.Subtract, P1=self.reg_zero, P3=reg,
-                          P4=operand_reg, comment='unary -')
+                self.emit(Opcode.Subtract, P1=self.reg_zero, P2=reg,
+                          P3=operand_reg, comment='unary -')
             elif op == '+':
                 self.emit(Opcode.MemCopy, P1=operand_reg, P2=reg, comment='unary +')
             elif op == '~':
@@ -272,10 +276,18 @@ class Compiler:
                       P4=expr.type_name.name.upper(), comment=f'CAST to {expr.type_name.name}')
 
         elif isinstance(expr, IsNullOp):
-            self.emit(Opcode.Null, P1=reg, comment='temp')
-            op = Opcode.Eq if expr.negated else Opcode.Ne
-            self.emit_compare_branch(op, self.compile_expr(expr.expr, cursor), self.reg_null, f'_isnull_{id(expr)}')
-            self.emit(Opcode.Integer, P1=1 if expr.negated else 0, P2=reg)
+            expr_reg = self.compile_expr(expr.expr, cursor)
+            lbl_skip = f'_isnull_skip_{id(expr)}'
+            lbl_end = f'_isnull_end_{id(expr)}'
+            if expr.negated:
+                self.emit_compare_branch(Opcode.Eq, expr_reg, self.reg_null, lbl_skip)
+            else:
+                self.emit_compare_branch(Opcode.Ne, expr_reg, self.reg_null, lbl_skip)
+            self.emit(Opcode.Integer, P1=1, P2=reg, comment='IS NULL true')
+            self.emit_goto(lbl_end)
+            self.define_label(lbl_skip)
+            self.emit(Opcode.Integer, P1=0, P2=reg, comment='IS NULL false')
+            self.define_label(lbl_end)
 
         elif isinstance(expr, BetweenOp):
             lo_reg = self.compile_expr(expr.low, cursor)
@@ -416,6 +428,7 @@ class Compiler:
             if isinstance(table_ref, TableName):
                 td = self._lookup_table_def(table_ref.name, table_ref.schema)
                 self.emit(Opcode.Transaction, P1=0, comment='begin read')
+                self.cursor_table[cursor] = td
                 self.emit(Opcode.OpenRead, P1=cursor, P2=td.root_page,
                           P3=len(td.columns), comment=f'open {td.name}')
                 self.emit(Opcode.Rewind, P1=cursor, P2=len(self.instructions) + 4,
@@ -446,6 +459,7 @@ class Compiler:
             self.emit_ifnot(where_reg, where_skip)
 
         # Result columns
+        self._current_select_columns = node.columns
         col_regs = []
         for rc in node.columns:
             if isinstance(rc.expr, StarExpr):
@@ -466,14 +480,16 @@ class Compiler:
             first_reg = 0
             n_cols = 0
 
+        # ORDER BY (must be before ResultRow to add sort keys)
+        if node.order_by:
+            n_cols = self._compile_order_by(first_reg, n_cols, node.order_by,
+                                            col_regs, cursor)
+            first_reg = min(col_regs) if col_regs else 0
+
         self.emit(Opcode.ResultRow, P1=first_reg, P2=n_cols, comment='emit row')
 
         if where_skip:
             self.define_label(where_skip)
-
-        # ORDER BY
-        if node.order_by:
-            self._compile_order_by(cursor, node.order_by)
 
         # LIMIT / OFFSET
         if node.limit or node.offset:
@@ -499,8 +515,23 @@ class Compiler:
         self.emit(Opcode.OpenEphemeral, P1=ep, P2=1, comment='compound set')
         op = node.compound_op.upper() if node.compound_op else 'UNION'
 
-    def _compile_order_by(self, cursor: int, terms: list[OrderingTerm]):
-        pass  # In-memory sort — add sorter logic when needed
+    def _compile_order_by(self, first_reg: int, n_cols: int, terms: list[OrderingTerm],
+                          col_regs: list[int], cursor: int) -> int:
+        # Build sort keys alongside result columns
+        # Uses cursor to compile expressions (needed when sort key is a table column not in result)
+        sort_keys = []
+        for term in terms:
+            k_reg = self.compile_expr(term.expr, cursor)
+            sort_keys.append((k_reg, term.direction == 'DESC'))
+            # Copy to a new register at the end of col_regs
+            target_reg = self.alloc_reg()
+            self.emit(Opcode.MemCopy, P1=k_reg, P2=target_reg,
+                      comment=f'sort key copy')
+            col_regs.append(target_reg)
+        n_visible = n_cols
+        sort_col_indices = [(n_visible + i, descending) for i, (_, descending) in enumerate(sort_keys)]
+        self.emit(Opcode.Sort, P1=n_visible, P4=sort_col_indices, comment='order by')
+        return len(col_regs)  # new total n_cols including sort keys
 
     # ── INSERT ──
 
@@ -523,7 +554,7 @@ class Compiler:
             self.emit(Opcode.Insert, P1=cursor, P2=record_reg, P3=rowid_reg,
                       comment='insert row')
         elif node.select:
-            self._compile_select(node.select)
+            self._compile_insert_select(node.select, cursor, td)
         elif node.values:
             col_count = len(td.columns) if not node.columns else len(node.columns)
             for row in node.values:
@@ -543,6 +574,49 @@ class Compiler:
         if node.returning:
             self._compile_returning(cursor, node.returning)
 
+    def _compile_insert_select(self, select: Select, dest_cursor: int, td: 'TableDef'):
+        if select.ctes:
+            self._compile_cte(select.ctes)
+        src_cursor = self.alloc_cursor()
+        if select.from_clause:
+            table_ref = select.from_clause[0]
+            if isinstance(table_ref, TableName):
+                src_td = self._lookup_table_def(table_ref.name, table_ref.schema)
+                self.cursor_table[src_cursor] = src_td
+                self.emit(Opcode.Transaction, P1=0, comment='begin read')
+                self.emit(Opcode.OpenRead, P1=src_cursor, P2=src_td.root_page,
+                          P3=len(src_td.columns), comment=f'open {src_td.name}')
+                self.emit(Opcode.Rewind, P1=src_cursor, P2=len(self.instructions) + 4,
+                          comment='rewind')
+        else:
+            self.emit(Opcode.OpenEphemeral, P1=src_cursor, P2=1, comment='dummy scan')
+
+        loop_start = len(self.instructions)
+        col_regs = []
+        for rc in select.columns:
+            if isinstance(rc.expr, StarExpr):
+                src_td = self._lookup_table(src_cursor)
+                for i in range(len(getattr(src_td, 'columns', []))):
+                    r = self.alloc_reg()
+                    col_regs.append(r)
+                    self.emit(Opcode.Column, P1=src_cursor, P2=i, P3=r,
+                              comment=f'column {i}')
+            else:
+                r = self.compile_expr(rc.expr, src_cursor)
+                col_regs.append(r)
+
+        rowid_reg = self.alloc_reg()
+        self.emit(Opcode.NewRowid, P1=dest_cursor, P2=0, P3=rowid_reg, comment='new rowid')
+        first_val = col_regs[0] if col_regs else self.reg_null
+        record_reg = self.alloc_reg()
+        self.emit(Opcode.MakeRecord, P1=first_val, P2=len(col_regs),
+                  P3=record_reg, comment='make record')
+        self.emit(Opcode.Insert, P1=dest_cursor, P2=record_reg, P3=rowid_reg,
+                  comment='insert row')
+
+        if select.from_clause:
+            self.emit(Opcode.Next, P1=src_cursor, P2=loop_start, comment='next row')
+
     # ── UPDATE ──
 
     def _compile_update(self, node: Update):
@@ -561,13 +635,25 @@ class Compiler:
             skip_label = self._label_name('update_skip')
             self.emit_ifnot(where_reg, skip_label)
 
-        # Delete old index entries, then update row
+        # Read all current column values, override with SET
         rowid_reg = self.alloc_reg()
         self.emit(Opcode.Rowid, P1=cursor, P2=rowid_reg, comment='current rowid')
-        col_regs = []
+        n_cols = len(td.columns)
+        col_regs = [self.alloc_reg() for _ in range(n_cols)]
+        for i in range(n_cols):
+            self.emit(Opcode.Column, P1=cursor, P2=i, P3=col_regs[i],
+                      comment=f'read col {i}')
         for sc in node.set_clauses:
-            vr = self.compile_expr(sc.expr, cursor)
-            col_regs.append(vr)
+            col_idx = -1
+            try:
+                col_idx = td.column_index(sc.column) if hasattr(td, 'column_index') else -1
+            except ValueError:
+                col_idx = -1
+            if col_idx >= 0:
+                set_reg = self.compile_expr(sc.expr, cursor)
+                if set_reg != col_regs[col_idx]:
+                    self.emit(Opcode.MemCopy, P1=set_reg, P2=col_regs[col_idx],
+                              comment=f'set {sc.column}')
         self.emit(Opcode.Delete, P1=cursor, comment='delete old row')
 
         # Insert updated row
@@ -613,8 +699,64 @@ class Compiler:
 
     def _compile_create_table(self, node: CreateTable):
         self.emit(Opcode.Transaction, P1=1, comment='DDL begin write')
+        # Allocate root page and register table
+        root_page = self.db.allocate_page() if self.db else 1
+        sql = self._reconstruct_create_table_sql(node)
+        from pysqlite.schema import ColumnDef as SchemaColumnDef
+        columns = []
+        for col in node.columns:
+            affinity = self.schema._determine_affinity(col.type_name)
+            columns.append(SchemaColumnDef(
+                name=col.name,
+                type_name=col.type_name,
+                affinity=affinity,
+                not_null=self.schema._has_constraint(col, 'NOT NULL') if hasattr(self.schema, '_has_constraint') else False,
+                primary_key=self.schema._has_constraint(col, 'PRIMARY KEY') if hasattr(self.schema, '_has_constraint') else False,
+                unique=self.schema._has_constraint(col, 'UNIQUE') if hasattr(self.schema, '_has_constraint') else False,
+                default_value=self.schema._get_default(col) if hasattr(self.schema, '_get_default') else None,
+                auto_increment=self.schema._has_autoinc(col) if hasattr(self.schema, '_has_autoinc') else False,
+                collation=self.schema._get_collation(col) if hasattr(self.schema, '_get_collation') else None,
+            ))
+        from pysqlite.schema import TableDef
+        td = TableDef(
+            name=node.name.name, root_page=root_page,
+            columns=columns, constraints=node.constraints,
+            without_rowid=node.without_rowid, strict=node.strict,
+            sql=sql,
+        )
+        if self.schema:
+            self.schema.tables[node.name.name] = td
+            from pysqlite.btree import BTree
+            btree = BTree(self.db, 1, is_table=True)
+            self.schema._insert_schema_entry(
+                btree, type_='table', name=node.name.name,
+                tbl_name=node.name.name, rootpage=root_page, sql=sql,
+            )
         self.emit(Opcode.CreateTable, P1=0, P4=node.name.name,
                   comment=f'CREATE TABLE {node.name.name}')
+
+    def _reconstruct_create_table_sql(self, node: CreateTable) -> str:
+        parts = [f'CREATE TABLE {node.name.name} (']
+        col_parts = []
+        for col in node.columns:
+            col_sql = col.name
+            if col.type_name and col.type_name.name:
+                col_sql += f' {col.type_name.name}'
+            for c in col.constraints:
+                if c.kind == 'PRIMARY KEY':
+                    col_sql += ' PRIMARY KEY'
+                    if c.details == 'AUTOINCREMENT':
+                        col_sql += ' AUTOINCREMENT'
+                elif c.kind == 'NOT NULL':
+                    col_sql += ' NOT NULL'
+                elif c.kind == 'UNIQUE':
+                    col_sql += ' UNIQUE'
+                elif c.kind == 'DEFAULT' and c.details is not None:
+                    col_sql += f' DEFAULT {c.details}'
+            col_parts.append(col_sql)
+        parts.append(', '.join(col_parts))
+        parts.append(')')
+        return ''.join(parts)
 
     def _compile_create_index(self, node: CreateIndex):
         self.emit(Opcode.Transaction, P1=1, comment='DDL begin write')
@@ -674,7 +816,7 @@ class Compiler:
     # ── Schema lookups ──
 
     def _lookup_table(self, cursor: int) -> TableDef | None:
-        return None
+        return self.cursor_table.get(cursor)
 
     def _lookup_table_def(self, name: str, schema: str | None = None) -> TableDef:
         if self.schema is not None and hasattr(self.schema, 'get_table'):

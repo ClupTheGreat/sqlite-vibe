@@ -23,7 +23,7 @@ class TestBTreePage:
     def test_new_leaf_page(self, pager):
         pn = pager.allocate_page()
         page = BTreePage(pager, pn)
-        assert page.page_type != PT_LEAF_TABLE  # zero-filled, not yet initialized
+        assert page.page_type == PT_LEAF_TABLE  # auto-initialized from zero-filled
         assert page.cell_count == 0
         assert page.first_freeblock == 0
 

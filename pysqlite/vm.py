@@ -64,8 +64,9 @@ class VmError(DatabaseError):
 
 
 class VM:
-    def __init__(self, pager):
+    def __init__(self, pager, tx=None):
         self.pager = pager
+        self.tx = tx
         self.program: list[Instruction] = []
         self.pc: int = 0
         self.registers: dict[int, Register] = {}
@@ -80,8 +81,10 @@ class VM:
         self.explain_mode: bool = False
         self._current_row: list[Register] = []
         self._affinity_cache: dict[str, int] = {}
-        from pysqlite.transaction import TransactionManager
-        self.tx = TransactionManager(self.pager, self.pager.vfs, self.pager.handle)
+        self.sort_spec: list[tuple[int, bool]] = []
+        if self.tx is None:
+            from pysqlite.transaction import TransactionManager
+            self.tx = TransactionManager(self.pager, self.pager.vfs, self.pager.handle)
 
     def run(self, program: list[Instruction]) -> list[list]:
         self.program = program
@@ -97,6 +100,7 @@ class VM:
         self.sub_return_stack = []
         self.explain_mode = False
         self._current_row = []
+        self.sort_spec = []
 
         if self.pager is None:
             self.error = 'No pager available'
@@ -111,7 +115,37 @@ class VM:
         if self.explain_mode:
             return self._build_explain_result()
 
+        if self.sort_spec:
+            self._sort_results()
+
         return self.result_rows
+
+    def _sort_results(self):
+        n_visible, sort_cols = self.sort_spec
+        def sort_key(row):
+            key = []
+            for col_idx, descending in sort_cols:
+                if col_idx < len(row):
+                    v = row[col_idx]
+                    if v is None:
+                        key.append((1,))
+                    else:
+                        key.append((0, v if not descending else self._negate(v)))
+                else:
+                    key.append((1,))
+            return key
+        self.result_rows.sort(key=sort_key)
+        # Strip hidden sort key columns from result
+        if n_visible < len(self.result_rows[0]) if self.result_rows else 0:
+            self.result_rows = [row[:n_visible] for row in self.result_rows]
+
+    @staticmethod
+    def _negate(v):
+        if v is None:
+            return None
+        if isinstance(v, (int, float)):
+            return -v
+        return v
 
     def step(self):
         if self.pc >= len(self.program):
@@ -315,12 +349,13 @@ class VM:
             self._set_reg(P3, Register())
 
     def _op_MakeRecord(self, P1: int, P2: int, P3: int, P4: Any, P5: int):
-        values = []
+        from pysqlite.record import Record as RecordEncoder
+        columns = []
         for i in range(P2):
             reg = self._reg(P1 + i)
-            values.append(reg.value)
-        from pysqlite.record import Record as RecordEncoder
-        rec = RecordEncoder(values)
+            st = RecordEncoder.serial_type(reg.value)
+            columns.append((st, reg.value))
+        rec = RecordEncoder(columns)
         blob = rec.encode()
         self._set_reg(P3, Register(RegisterType.BLOB, blob))
 
@@ -863,6 +898,10 @@ class VM:
         pass
 
     # ── Noop ──
+
+    def _op_Sort(self, P1: int, P2: int, P3: int, P4: Any, P5: int):
+        if isinstance(P4, list):
+            self.sort_spec = (P1, P4)  # (n_visible, [(col_idx, descending), ...])
 
     def _op_Noop(self, P1: int, P2: int, P3: int, P4: Any, P5: int):
         pass

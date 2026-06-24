@@ -196,6 +196,66 @@ When you encounter a problem during development, add an entry like:
     0 cells (interior) and right_child was set to 0, first() would try
     to read page 0 (invalid). Fixed by converting the root to a leaf
     page if it's interior with 0 cells after rebalance.
+
+[2026-06-24] Compiler reg_zero/reg_one/reg_null registers never initialized
+  - File: pysqlite/compile.py:44-46 (fixed)
+  - Severity: high
+  - Details: Compiler allocated register numbers 0/1/2 for zero/one/null
+    constants but never emitted Integer/Null opcodes to set them. Any
+    instruction referencing reg_zero (e.g., Subtract P1=reg_zero for unary
+    minus) read a default NULL register. Fixed by emitting Integer/Null
+    opcodes for all three constants at the start of every program.
+
+[2026-06-24] IS NULL / IS NOT NULL compilation missing label definition
+  - File: pysqlite/compile.py:277-281 (fixed)
+  - Severity: high
+  - Details: emit_compare_branch created a branch with an unresolved label
+    (_isnull_{id}) that was never defined. The compiler emitted only one
+    Integer for the false case but never defined the label for the true
+    case. Fixed by restructuring with proper lbl_skip/lbl_end label pair.
+
+[2026-06-24] SELECT * failed because _lookup_table always returned None
+  - File: pysqlite/compile.py:687-688 (fixed)
+  - Severity: high
+  - Details: _lookup_table(cursor) unconditionally returned None, so StarExpr
+    expansion in _compile_select found 0 columns and ResultRow emitted an
+    empty row. Fixed by adding cursor_table dict mapping cursor→TableDef
+    and returning self.cursor_table.get(cursor).
+
+[2026-06-24] Zeroed B-Tree pages not initialized as leaf table pages
+  - File: pysqlite/btree.py:28-35 (fixed)
+  - Severity: high
+  - Details: pager.allocate_page() zeroes new pages. BTreePage parses a 0
+    page type, which is neither leaf nor interior, causing is_leaf()=False
+    and the insert loop to follow right_child=0 → page 0 out of range.
+    Fixed by auto-initializing zeroed pages as PT_LEAF_TABLE in __init__.
+
+[2026-06-24] INSERT INTO ... SELECT * did not expand StarExpr
+  - File: pysqlite/compile.py:594-606 (fixed)
+  - Severity: high
+  - Details: _compile_insert_select called compile_expr(rc.expr) for each
+    result column. For StarExpr, compile_expr emits Null (placeholder) instead
+    of expanding to table columns. Fixed by adding StarExpr expansion with
+    Column opcodes inside _compile_insert_select.
+
+[2026-06-24] UPDATE SET values not contiguous in registers for MakeRecord
+  - File: pysqlite/compile.py:605-610 (fixed)
+  - Severity: high
+  - Details: After reading all column values and computing SET expressions,
+    the SET value might be in a different register than the column's original
+    slot. MakeRecord reads a contiguous range, so it picked up the old column
+    value instead of the SET value. Fixed by adding MemCopy from SET register
+    to the column's original register slot.
+
+[2026-06-24] ORDER BY sort post-process fails when key not in SELECT list
+  - File: pysqlite/compile.py:516-531, vm.py:89-117 (fixed)
+  - Severity: medium
+  - Details: The Sort opcode sorted result_rows by column index in the result
+    row. When ORDER BY referenced a column not in the SELECT list (e.g.,
+    SELECT b FROM t ORDER BY a), it picked the wrong column or fell back to
+    index 0. Fixed by computing sort key expressions and appending them as
+    hidden columns in the result row, sorting by those hidden columns, then
+    stripping them after sort.
 ```
 
 
