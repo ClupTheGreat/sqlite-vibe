@@ -82,6 +82,7 @@ class VM:
         self._current_row: list[Register] = []
         self._affinity_cache: dict[str, int] = {}
         self.sort_spec: list[tuple[int, bool]] = []
+        self.agg_spec: dict | None = None
         if self.tx is None:
             from pysqlite.transaction import TransactionManager
             self.tx = TransactionManager(self.pager, self.pager.vfs, self.pager.handle)
@@ -101,6 +102,7 @@ class VM:
         self.explain_mode = False
         self._current_row = []
         self.sort_spec = []
+        self.agg_spec = None
 
         if self.pager is None:
             self.error = 'No pager available'
@@ -117,6 +119,9 @@ class VM:
 
         if self.sort_spec:
             self._sort_results()
+
+        if self.agg_spec:
+            self._do_aggregation()
 
         return self.result_rows
 
@@ -902,6 +907,179 @@ class VM:
     def _op_Sort(self, P1: int, P2: int, P3: int, P4: Any, P5: int):
         if isinstance(P4, list):
             self.sort_spec = (P1, P4)  # (n_visible, [(col_idx, descending), ...])
+
+    def _op_Aggregate(self, P1: int, P2: int, P3: int, P4: Any, P5: int):
+        if isinstance(P4, dict):
+            self.agg_spec = P4
+
+    def _do_aggregation(self):
+        spec = self.agg_spec
+        if not spec:
+            return
+        n_visible = spec.get('n_visible', 0)
+        group_by_cols = spec.get('group_by', [])
+        aggs = spec.get('aggs', [])
+        having = spec.get('having', None)
+        rows = self.result_rows
+        if not rows:
+            return
+
+        groups: dict = {}
+        for row in rows:
+            key = tuple(row[i] if i < len(row) else None for i in group_by_cols) if group_by_cols else ()
+            if key not in groups:
+                groups[key] = []
+            groups[key].append(row)
+
+        result = []
+        for key, grp in groups.items():
+            group_key = list(key) if group_by_cols else []
+            agg_results = []
+            for agg in aggs:
+                vals = []
+                name = agg.get('name', 'COUNT')
+                star = agg.get('star', False)
+                distinct = agg.get('distinct', False)
+                col = agg.get('col', 0)
+                n_args = agg.get('n_args', 1)
+                if star:
+                    vals = [None] * len(grp)
+                else:
+                    arg_start = agg.get('arg_start', col)
+                    for row in grp:
+                        v = row[arg_start] if arg_start < len(row) else None
+                        vals.append(v)
+                if distinct:
+                    seen = set()
+                    uniq = []
+                    for v in vals:
+                        if v not in seen:
+                            seen.add(v)
+                            uniq.append(v)
+                    vals = uniq
+                result_val = self._compute_aggregate(name, vals, star)
+                agg_results.append(result_val)
+
+            if having:
+                if not self._eval_having(having, group_key, agg_results):
+                    continue
+
+            out = group_key + agg_results
+            if group_by_cols and len(out) > n_visible:
+                out = out[:n_visible]
+            result.append(out)
+
+        if not group_by_cols and aggs and result:
+            result = [result[0]]
+
+        self.result_rows = result
+
+    def _eval_having(self, expr, group_key, agg_results):
+        if not isinstance(expr, (list, tuple)):
+            return bool(expr)
+        op = expr[0]
+        if op == 'literal':
+            val = expr[1]
+            return bool(val) if val is not None else False
+        elif op == 'column':
+            return True  # bare column in HAVING is always true if group exists
+        elif op == 'agg_result':
+            idx = expr[1]
+            if idx < len(agg_results):
+                v = agg_results[idx]
+                return bool(v) if v is not None else False
+            return False
+        elif op == 'isnull':
+            inner = self._eval_having(expr[1], group_key, agg_results)
+            negated = expr[2] if len(expr) > 2 else False
+            return not inner if negated else not bool(inner)
+        elif op in ('AND', 'and', '&'):
+            return self._eval_having(expr[1], group_key, agg_results) and self._eval_having(expr[2], group_key, agg_results)
+        elif op in ('OR', 'or', '|'):
+            return self._eval_having(expr[1], group_key, agg_results) or self._eval_having(expr[2], group_key, agg_results)
+        elif op == 'NOT':
+            return not self._eval_having(expr[1], group_key, agg_results)
+        elif op in ('=', '==', 'eq', 'Eq'):
+            return self._eval_having_val(expr[1], group_key, agg_results) == self._eval_having_val(expr[2], group_key, agg_results)
+        elif op in ('<>', '!=', 'ne', 'Ne'):
+            return self._eval_having_val(expr[1], group_key, agg_results) != self._eval_having_val(expr[2], group_key, agg_results)
+        elif op in ('<', 'lt', 'Lt'):
+            left = self._eval_having_val(expr[1], group_key, agg_results)
+            right = self._eval_having_val(expr[2], group_key, agg_results)
+            return left < right if left is not None and right is not None else False
+        elif op in ('<=', 'le', 'Le'):
+            left = self._eval_having_val(expr[1], group_key, agg_results)
+            right = self._eval_having_val(expr[2], group_key, agg_results)
+            return left <= right if left is not None and right is not None else False
+        elif op in ('>', 'gt', 'Gt'):
+            left = self._eval_having_val(expr[1], group_key, agg_results)
+            right = self._eval_having_val(expr[2], group_key, agg_results)
+            return left > right if left is not None and right is not None else False
+        elif op in ('>=', 'ge', 'Ge'):
+            left = self._eval_having_val(expr[1], group_key, agg_results)
+            right = self._eval_having_val(expr[2], group_key, agg_results)
+            return left >= right if left is not None and right is not None else False
+        return True
+
+    def _eval_having_val(self, expr, group_key, agg_results):
+        if not isinstance(expr, (list, tuple)):
+            return expr
+        op = expr[0]
+        if op == 'literal':
+            return expr[1]
+        elif op == 'column':
+            return None  # bare columns not evaluated
+        elif op == 'agg_result':
+            idx = expr[1]
+            return agg_results[idx] if idx < len(agg_results) else None
+        elif op in ('-',):
+            return -self._eval_having_val(expr[1], group_key, agg_results)
+        elif op in ('+',):
+            return self._eval_having_val(expr[1], group_key, agg_results)
+        elif op in ('*',):
+            return self._eval_having_val(expr[1], group_key, agg_results) * self._eval_having_val(expr[2], group_key, agg_results)
+        elif op in ('/',):
+            left = self._eval_having_val(expr[1], group_key, agg_results)
+            right = self._eval_having_val(expr[2], group_key, agg_results)
+            if right:
+                return left / right
+            return None
+        return None
+
+    @staticmethod
+    def _compute_aggregate(name: str, values: list, star: bool = False):
+        name_upper = name.upper()
+        if name_upper == 'COUNT':
+            if star:
+                return len(values)
+            return sum(1 for v in values if v is not None)
+        elif name_upper in ('SUM', 'TOTAL'):
+            total = 0
+            for v in values:
+                if isinstance(v, (int, float)):
+                    total += v
+            return total
+        elif name_upper == 'AVG':
+            total = 0
+            count = 0
+            for v in values:
+                if isinstance(v, (int, float)):
+                    total += v
+                    count += 1
+            return total / count if count else 0
+        elif name_upper == 'MIN':
+            non_null = [v for v in values if v is not None]
+            return min(non_null) if non_null else None
+        elif name_upper == 'MAX':
+            non_null = [v for v in values if v is not None]
+            return max(non_null) if non_null else None
+        elif name_upper == 'GROUP_CONCAT':
+            if star:
+                non_null = [str(v) for v in values]
+            else:
+                non_null = [str(v) for v in values if v is not None]
+            return ','.join(non_null) if non_null else None
+        return len(values)
 
     def _op_Noop(self, P1: int, P2: int, P3: int, P4: Any, P5: int):
         pass

@@ -256,6 +256,19 @@ When you encounter a problem during development, add an entry like:
     index 0. Fixed by computing sort key expressions and appending them as
     hidden columns in the result row, sorting by those hidden columns, then
     stripping them after sort.
+
+[2026-06-25] Aggregate + GROUP BY post-process aggregation implemented
+  - File: pysqlite/compile.py:427-470, pysqlite/vm.py:117-119,217-318 (new)
+  - Severity: low (new feature, no bugs)
+  - Details: Implemented aggregate functions (COUNT, SUM, AVG, MIN, MAX,
+    GROUP_CONCAT, TOTAL) + GROUP BY + HAVING via post-process deferred
+    aggregation. The compiler compiles result columns into registers,
+    appends hidden GROUP BY columns, and emits an Aggregate opcode with
+    a spec dict. After the VM scan loop, _do_aggregation groups
+    result_rows by hidden key columns, computes aggregates per group, and
+    strips hidden columns. HAVING is evaluated via serialized expression
+    tree. Register ordering pitfall: visible columns must be compiled
+    before hidden columns so ResultRow outputs them in the correct order.
 ```
 
 

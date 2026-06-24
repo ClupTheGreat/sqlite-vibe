@@ -97,7 +97,7 @@
 ## Phase 7: Full SQL Feature Set
 
 ```
-[ ] 7.1 Aggregate functions (COUNT, SUM, AVG, MIN, MAX, GROUP_CONCAT, TOTAL)
+[x] 7.1 Aggregate functions (COUNT, SUM, AVG, MIN, MAX, GROUP_CONCAT, TOTAL) + GROUP BY + HAVING
 [x] 7.2 Scalar functions (LENGTH, UPPER, LOWER — via SQL integration tests)
 [x] 7.3 Numeric functions (ABS — via SQL integration tests)
 [ ] 7.4 Math functions (ACOS, SIN, COS, LOG, SQRT, PI, etc.)
@@ -132,7 +132,7 @@
 
 ```
 [ ] 9.1 Unit tests (all modules)
-[x] 9.2 SQL integration tests (27 end-to-end tests: DDL, DML, SELECT, expressions, ORDER BY, functions, transactions)
+[x] 9.2 SQL integration tests (39 end-to-end tests: DDL, DML, SELECT, expressions, ORDER BY, functions, aggregation, GROUP BY, HAVING, transactions)
 [ ] 9.3 Compatibility tests (against real sqlite3)
 [ ] 9.4 Stress tests (large data, transactions)
 [ ] 9.5 Fuzz tests (random SQL, corrupt DB)

@@ -156,6 +156,85 @@ class TestFunctions:
         assert res == [['hello']]
 
 
+class TestAggregates:
+    def test_count_star(self, db):
+        db.execute('CREATE TABLE t (a INT)')
+        db.execute('INSERT INTO t VALUES (1), (2), (3)')
+        res = db.execute('SELECT COUNT(*) FROM t')
+        assert res == [[3]]
+
+    def test_count_col(self, db):
+        db.execute('CREATE TABLE t (a INT)')
+        db.execute('INSERT INTO t VALUES (1), (NULL), (3)')
+        res = db.execute('SELECT COUNT(a) FROM t')
+        assert res == [[2]]
+
+    def test_sum(self, db):
+        db.execute('CREATE TABLE t (a INT)')
+        db.execute('INSERT INTO t VALUES (1), (2), (3)')
+        res = db.execute('SELECT SUM(a) FROM t')
+        assert res == [[6]]
+
+    def test_avg(self, db):
+        db.execute('CREATE TABLE t (a REAL)')
+        db.execute('INSERT INTO t VALUES (1.0), (2.0), (3.0)')
+        res = db.execute('SELECT AVG(a) FROM t')
+        assert abs(res[0][0] - 2.0) < 0.001
+
+    def test_min(self, db):
+        db.execute('CREATE TABLE t (a INT)')
+        db.execute('INSERT INTO t VALUES (3), (1), (2)')
+        res = db.execute('SELECT MIN(a) FROM t')
+        assert res == [[1]]
+
+    def test_max(self, db):
+        db.execute('CREATE TABLE t (a INT)')
+        db.execute('INSERT INTO t VALUES (3), (1), (2)')
+        res = db.execute('SELECT MAX(a) FROM t')
+        assert res == [[3]]
+
+    def test_group_concat(self, db):
+        db.execute('CREATE TABLE t (a TEXT)')
+        db.execute("INSERT INTO t VALUES ('x'), ('y'), ('z')")
+        res = db.execute('SELECT GROUP_CONCAT(a) FROM t')
+        assert res == [['x,y,z']]
+
+    def test_group_by(self, db):
+        db.execute('CREATE TABLE t (cat TEXT, val INT)')
+        db.execute("INSERT INTO t VALUES ('a', 10), ('a', 20), ('b', 30)")
+        res = db.execute('SELECT cat, SUM(val) FROM t GROUP BY cat ORDER BY cat')
+        assert res == [['a', 30], ['b', 30]]
+
+    def test_group_by_count(self, db):
+        db.execute('CREATE TABLE t (cat TEXT)')
+        db.execute("INSERT INTO t VALUES ('a'), ('a'), ('b')")
+        res = db.execute('SELECT cat, COUNT(*) FROM t GROUP BY cat ORDER BY cat')
+        assert res == [['a', 2], ['b', 1]]
+
+    def test_group_by_having(self, db):
+        db.execute('CREATE TABLE t (cat TEXT, val INT)')
+        db.execute("INSERT INTO t VALUES ('a', 1), ('a', 2), ('b', 10)")
+        res = db.execute('SELECT cat, SUM(val) FROM t GROUP BY cat HAVING SUM(val) > 5')
+        assert res == [['b', 10]]
+
+    def test_multiple_aggregates(self, db):
+        db.execute('CREATE TABLE t (a INT)')
+        db.execute('INSERT INTO t VALUES (1), (2), (3)')
+        res = db.execute('SELECT COUNT(*), SUM(a), AVG(a), MIN(a), MAX(a) FROM t')
+        row = res[0]
+        assert row[0] == 3  # COUNT
+        assert row[1] == 6  # SUM
+        assert row[2] == 2.0  # AVG
+        assert row[3] == 1  # MIN
+        assert row[4] == 3  # MAX
+
+    def test_where_with_aggregate(self, db):
+        db.execute('CREATE TABLE t (a INT)')
+        db.execute('INSERT INTO t VALUES (1), (2), (3), (4)')
+        res = db.execute('SELECT COUNT(*) FROM t WHERE a > 2')
+        assert res == [[2]]
+
+
 class TestTransactions:
     def test_begin_commit(self, db):
         db.execute('CREATE TABLE t (a INT)')

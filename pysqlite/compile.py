@@ -24,6 +24,9 @@ from pysqlite.ast import (
 )
 
 
+AGGREGATE_FUNCTIONS = frozenset({'COUNT', 'SUM', 'AVG', 'MIN', 'MAX', 'GROUP_CONCAT', 'TOTAL'})
+
+
 # ── Compiler ──
 
 class CompilerError(Exception):
@@ -171,6 +174,44 @@ class Compiler:
         for label, positions in self.pending_labels.items():
             for pos in positions:
                 raise CompilerError(f'Unresolved label: {label}')
+
+    # ── Aggregate detection ──
+
+    @staticmethod
+    def _is_aggregate(expr: Expr) -> bool:
+        return isinstance(expr, FunctionCall) and expr.name.upper() in AGGREGATE_FUNCTIONS
+
+    def _has_aggregates(self, node: Select) -> bool:
+        if node.group_by:
+            return True
+        for rc in node.columns:
+            if self._is_aggregate(rc.expr):
+                return True
+        return False
+
+    def _serialize_having(self, expr: Expr, aggs: list[dict]) -> Any:
+        if isinstance(expr, Literal):
+            return ('literal', expr.value)
+        elif isinstance(expr, NullLiteral):
+            return ('literal', None)
+        elif isinstance(expr, ColumnRef):
+            return ('column', expr.name)
+        elif isinstance(expr, BinaryOp):
+            left = self._serialize_having(expr.left, aggs)
+            right = self._serialize_having(expr.right, aggs)
+            return (expr.op, left, right)
+        elif isinstance(expr, UnaryOp):
+            return (expr.op, self._serialize_having(expr.operand, aggs))
+        elif isinstance(expr, FunctionCall):
+            if expr.name.upper() in AGGREGATE_FUNCTIONS:
+                for i, a in enumerate(aggs):
+                    if a['name'] == expr.name.upper() and a.get('star') == expr.star:
+                        return ('agg_result', i)
+                return ('literal', None)
+            return ('literal', None)
+        elif isinstance(expr, IsNullOp):
+            return ('isnull', self._serialize_having(expr.expr, aggs), expr.negated)
+        return ('literal', None)
 
     # ── Expression compiler ──
 
@@ -422,6 +463,12 @@ class Compiler:
         if node.ctes:
             self._compile_cte(node.ctes)
         cursor = self.alloc_cursor()
+
+        # If aggregates or GROUP BY, use aggregation compiler
+        if self._has_aggregates(node):
+            self._compile_aggregation(node, cursor)
+            return
+
         # Determine table/root page
         if node.from_clause:
             table_ref = node.from_clause[0]
@@ -509,6 +556,93 @@ class Compiler:
         # Compound (UNION/INTERSECT/EXCEPT)
         if node.compound_select:
             self._compile_compound(node)
+
+    def _compile_aggregation(self, node: Select, cursor: int):
+        if node.from_clause:
+            table_ref = node.from_clause[0]
+            if isinstance(table_ref, TableName):
+                td = self._lookup_table_def(table_ref.name, table_ref.schema)
+                self.emit(Opcode.Transaction, P1=0, comment='begin read')
+                self.cursor_table[cursor] = td
+                self.emit(Opcode.OpenRead, P1=cursor, P2=td.root_page,
+                          P3=len(td.columns), comment=f'open {td.name}')
+                self.emit(Opcode.Rewind, P1=cursor, P2=len(self.instructions) + 4,
+                          comment='rewind')
+            elif isinstance(table_ref, SubqueryTable):
+                sub = Compiler(self.schema, self.db)
+                sub_prog = sub.compile(table_ref.select)
+                self.instructions.extend(sub_prog)
+                self.emit(Opcode.OpenEphemeral, P1=cursor, P2=1,
+                          comment='subquery result')
+            else:
+                self.emit(Opcode.OpenEphemeral, P1=cursor, P2=1,
+                          comment='table ref')
+        else:
+            self.emit(Opcode.OpenEphemeral, P1=cursor, P2=1,
+                      comment='dummy scan')
+
+        loop_start = len(self.instructions)
+
+        where_skip = None
+        if node.where:
+            where_reg = self.compile_expr(node.where, cursor)
+            where_skip = self._label_name('agg_where_skip')
+            self.emit_ifnot(where_reg, where_skip)
+
+        agg_spec = {
+            'n_visible': len(node.columns),
+            'group_by': [],
+            'aggs': [],
+        }
+        col_regs = []
+
+        for rc in node.columns:
+            if self._is_aggregate(rc.expr):
+                func = rc.expr
+                if func.star:
+                    dummy = self.alloc_reg()
+                    self.emit(Opcode.Integer, P1=0, P2=dummy, comment='agg dummy')
+                    col_regs.append(dummy)
+                    agg_spec['aggs'].append({
+                        'name': func.name.upper(), 'star': True,
+                        'distinct': func.distinct, 'col': len(col_regs) - 1,
+                    })
+                else:
+                    arg_regs = [self.compile_expr(a, cursor) for a in func.args]
+                    first_arg = len(col_regs)
+                    col_regs.extend(arg_regs)
+                    agg_spec['aggs'].append({
+                        'name': func.name.upper(), 'star': False,
+                        'distinct': func.distinct, 'col': first_arg,
+                        'n_args': len(arg_regs),
+                    })
+            else:
+                r = self.compile_expr(rc.expr, cursor)
+                col_regs.append(r)
+
+        hidden_cols = []
+        for gb_expr in node.group_by:
+            r = self.compile_expr(gb_expr, cursor)
+            hidden_cols.append(r)
+
+        hidden_start = len(col_regs)
+        col_regs.extend(hidden_cols)
+        agg_spec['group_by'] = list(range(hidden_start, hidden_start + len(hidden_cols)))
+
+        if node.having:
+            agg_spec['having'] = self._serialize_having(node.having, agg_spec['aggs'])
+
+        self.emit(Opcode.Aggregate, P1=0, P4=agg_spec, comment='aggregation spec')
+
+        if col_regs:
+            self.emit(Opcode.ResultRow, P1=min(col_regs), P2=len(col_regs),
+                      comment='emit row')
+
+        if where_skip:
+            self.define_label(where_skip)
+
+        if node.from_clause:
+            self.emit(Opcode.Next, P1=cursor, P2=loop_start, comment='next row')
 
     def _compile_compound(self, node: Select):
         ep = self.alloc_cursor()

@@ -102,6 +102,9 @@ class Opcode:
     AggInvert = 'AggInvert'
     AggReset = 'AggReset'
 
+    # Aggregation
+    Aggregate = 'Aggregate'
+
     # Sorting
     SorterOpen = 'SorterOpen'
     SorterInsert = 'SorterInsert'
