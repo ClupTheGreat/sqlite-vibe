@@ -181,6 +181,14 @@ When you encounter a problem during development, add an entry like:
   - Details: TokenType was missing NULLS, ADD, COLUMN, TRANSACTION, RENAME,
     BEFORE, AFTER, INSTEAD, FIRST, LAST. All added with keyword mappings.
 
+[2026-06-24] Compiler _compile_binary_op used P2 as jump address for arithmetic ops
+  - File: pysqlite/compile.py:370-385 (fixed)
+  - Severity: high
+  - Details: Binary operator compilation for arithmetic (Add, Subtract, etc.)
+    set P2 to an instruction index (for label patching) instead of the
+    destination register. Split arithmetic and comparison maps; arithmetic
+    ops use P2=dest, comparison ops use P2=jump with proper label patching.
+
 [2026-06-24] _rebalance_after_delete left root as interior with 0 cells
   - File: pysqlite/btree.py:744-795 (fixed)
   - Severity: medium

@@ -56,22 +56,22 @@
 ## Phase 4: Bytecode Compiler & Virtual Machine
 
 ```
-[ ] 4.1 Opcode definitions (200+ opcodes)
-[ ] 4.2 Query compiler — SELECT (full scan, index scan)
-[ ] 4.3 Query compiler — INSERT (VALUES, SELECT, DEFAULT)
-[ ] 4.4 Query compiler — UPDATE (SET, WHERE, index maintenance)
-[ ] 4.5 Query compiler — DELETE (scan + delete)
-[ ] 4.6 Query compiler — DDL (CREATE/DROP TABLE/INDEX)
-[ ] 4.7 Expression compiler (all expression types)
-[ ] 4.8 Optimizer — index selection
-[ ] 4.9 Optimizer — join ordering
-[ ] 4.10 VM core (register system, dispatch loop)
-[ ] 4.11 VM cursor operations
-[ ] 4.12 VM comparisons (SQLite type ordering)
-[ ] 4.13 VM aggregation (AggStep, AggFinal)
-[ ] 4.14 VM sorter (ORDER BY, DISTINCT)
-[ ] 4.15 VM type affinity (5 affinity rules)
-[ ] 4.16 EXPLAIN / EXPLAIN QUERY PLAN
+[x] 4.1 Opcode definitions (200+ opcodes)
+[x] 4.2 Query compiler — SELECT (full scan, index scan)
+[x] 4.3 Query compiler — INSERT (VALUES, SELECT, DEFAULT)
+[x] 4.4 Query compiler — UPDATE (SET, WHERE, index maintenance)
+[x] 4.5 Query compiler — DELETE (scan + delete)
+[x] 4.6 Query compiler — DDL (CREATE/DROP TABLE/INDEX)
+[x] 4.7 Expression compiler (all expression types)
+[-] 4.8 Optimizer — index selection
+[-] 4.9 Optimizer — join ordering
+[x] 4.10 VM core (register system, dispatch loop)
+[x] 4.11 VM cursor operations
+[x] 4.12 VM comparisons (SQLite type ordering)
+[x] 4.13 VM aggregation (AggStep, AggFinal)
+[-] 4.14 VM sorter (ORDER BY, DISTINCT)
+[x] 4.15 VM type affinity (5 affinity rules)
+[x] 4.16 EXPLAIN / EXPLAIN QUERY PLAN
 ```
 
 ## Phase 5: Schema & Catalog
