@@ -1,6 +1,6 @@
 """Tests for the bytecode compiler."""
 
-from pysqlite.compile import Compiler, TableDefInfo, ColumnDefInfo
+from pysqlite.compile import Compiler
 from pysqlite.opcode import Opcode
 from pysqlite.ast import (
     Select, Insert, Update, Delete,

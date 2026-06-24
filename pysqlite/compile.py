@@ -1,9 +1,11 @@
 """Bytecode compiler — walks AST and emits VDBE instructions."""
 
-from dataclasses import dataclass, field
 from typing import Any
 
 from pysqlite.opcode import Instruction, Opcode
+from pysqlite.schema import (
+    TableDef, ColumnDef, IndexDef, IndexedColumnDef, AFFINITY,
+)
 from pysqlite.ast import (
     Statement, Expr,
     Select, Insert, Update, Delete,
@@ -17,59 +19,9 @@ from pysqlite.ast import (
     StarExpr, RaiseFunction, RowValue,
     ResultColumn, OrderingTerm, SetClause, Returning, CTE,
     TableName, TableFunction, SubqueryTable, JoinClause,
-    ColumnDef, ColumnConstraint, TableConstraint, TypeName,
+    ColumnDef as AstColumnDef, ColumnConstraint, TableConstraint, TypeName,
     WindowDef, WindowFrame, OnConflict,
 )
-
-
-# ── Schema types (will move to schema.py in Phase 5) ──
-
-class AFFINITY:
-    INTEGER = 0
-    REAL = 1
-    NUMERIC = 2
-    TEXT = 3
-    BLOB = 4
-
-
-@dataclass
-class IndexedColumnDef:
-    name: str
-    collation: str | None = None
-    order: str = 'ASC'
-    expr: Expr | None = None
-
-
-@dataclass
-class ColumnDefInfo:
-    name: str
-    type_name: str | None = None
-    affinity: int = AFFINITY.BLOB
-    not_null: bool = False
-    primary_key: bool = False
-    unique: bool = False
-    default_value: Any = None
-    auto_increment: bool = False
-    collation: str | None = None
-
-
-@dataclass
-class IndexDefInfo:
-    name: str
-    table_name: str
-    root_page: int = 0
-    columns: list[IndexedColumnDef] = field(default_factory=list)
-    unique: bool = False
-    partial: bool = False
-
-
-@dataclass
-class TableDefInfo:
-    name: str
-    root_page: int = 0
-    columns: list[ColumnDefInfo] = field(default_factory=list)
-    without_rowid: bool = False
-    strict: bool = False
 
 
 # ── Compiler ──
@@ -721,17 +673,17 @@ class Compiler:
 
     # ── Schema lookups ──
 
-    def _lookup_table(self, cursor: int) -> TableDefInfo | None:
+    def _lookup_table(self, cursor: int) -> TableDef | None:
         return None
 
-    def _lookup_table_def(self, name: str, schema: str | None = None) -> TableDefInfo:
+    def _lookup_table_def(self, name: str, schema: str | None = None) -> TableDef:
         if self.schema is not None and hasattr(self.schema, 'get_table'):
             td = self.schema.get_table(name, schema)
             if td is not None:
                 return td
-        return TableDefInfo(name=name, root_page=1, columns=[])
+        return TableDef(name=name, root_page=1, columns=[])
 
-    def _column_index(self, table_def: TableDefInfo | None, col_name: str) -> int:
+    def _column_index(self, table_def: TableDef | None, col_name: str) -> int:
         if table_def and table_def.columns:
             for i, c in enumerate(table_def.columns):
                 if c.name.upper() == col_name.upper():

@@ -151,6 +151,10 @@ class Parser:
             return self._parse_create_virtual_table()
         raise ParseError(f"Expected TABLE/INDEX/VIEW/TRIGGER/VIRTUAL after CREATE")
 
+    def parse_create_table(self, temp: bool = False) -> CreateTable:
+        """Public convenience — parse a single CREATE TABLE from pre-tokenized input."""
+        return self._parse_create_table(temp)
+
     def _parse_create_table(self, temp: bool = False) -> CreateTable:
         self.advance()
         if_not_exists = False

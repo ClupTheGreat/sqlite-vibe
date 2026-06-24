@@ -77,10 +77,10 @@
 ## Phase 5: Schema & Catalog
 
 ```
-[ ] 5.1 Schema manager (sqlite_schema load/save)
-[ ] 5.2 Column affinity determination
-[ ] 5.3 Collation sequences (BINARY, NOCASE, RTRIM)
-[ ] 5.4 Schema versioning (cookie, VerifyCookie)
+[x] 5.1 Schema manager (sqlite_schema load/save)
+[x] 5.2 Column affinity determination
+[x] 5.3 Collation sequences (BINARY, NOCASE, RTRIM)
+[x] 5.4 Schema versioning (cookie, VerifyCookie)
 ```
 
 ## Phase 6: Transaction & Concurrency

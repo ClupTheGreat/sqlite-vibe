@@ -23,6 +23,8 @@ class BTreePage:
         'right_child', 'cell_pointers', 'raw_data', 'dirty',
     )
 
+    DB_HEADER_SIZE = 100
+
     def __init__(self, pager: 'Pager', page_number: int):
         self.pager = pager
         self.page_number = page_number
@@ -31,36 +33,43 @@ class BTreePage:
         self._parse_header()
         self._parse_cell_pointers()
 
+    @property
+    def b_tree_offset(self) -> int:
+        return self.DB_HEADER_SIZE if self.page_number == 1 else 0
+
     def _parse_header(self):
+        off = self.b_tree_offset
         data = self.raw_data
-        self.page_type = data[0]
-        self.first_freeblock = int.from_bytes(data[1:3], 'big')
-        self.cell_count = int.from_bytes(data[3:5], 'big')
-        self.cell_content_offset = int.from_bytes(data[5:7], 'big')
-        self.fragmented_free_bytes = data[7]
+        self.page_type = data[off + 0]
+        self.first_freeblock = int.from_bytes(data[off + 1:off + 3], 'big')
+        self.cell_count = int.from_bytes(data[off + 3:off + 5], 'big')
+        self.cell_content_offset = int.from_bytes(data[off + 5:off + 7], 'big')
+        self.fragmented_free_bytes = data[off + 7]
 
         if self.page_type in (PT_INTERIOR_TABLE, PT_INTERIOR_INDEX):
-            self.right_child = int.from_bytes(data[8:12], 'big')
+            self.right_child = int.from_bytes(data[off + 8:off + 12], 'big')
         else:
             self.right_child = 0
 
     def _write_header(self):
+        off = self.b_tree_offset
         data = self.raw_data
-        data[0] = self.page_type
-        data[1:3] = self.first_freeblock.to_bytes(2, 'big')
-        data[3:5] = self.cell_count.to_bytes(2, 'big')
-        data[5:7] = self.cell_content_offset.to_bytes(2, 'big')
-        data[7] = self.fragmented_free_bytes
+        data[off + 0] = self.page_type
+        data[off + 1:off + 3] = self.first_freeblock.to_bytes(2, 'big')
+        data[off + 3:off + 5] = self.cell_count.to_bytes(2, 'big')
+        data[off + 5:off + 7] = self.cell_content_offset.to_bytes(2, 'big')
+        data[off + 7] = self.fragmented_free_bytes
 
         if self.page_type in (PT_INTERIOR_TABLE, PT_INTERIOR_INDEX):
-            data[8:12] = self.right_child.to_bytes(4, 'big')
+            data[off + 8:off + 12] = self.right_child.to_bytes(4, 'big')
         self.dirty = True
 
     def _parse_cell_pointers(self):
+        off = self.b_tree_offset
         self.cell_pointers = []
         base = 12 if self.page_type in (PT_INTERIOR_TABLE, PT_INTERIOR_INDEX) else 8
         for i in range(self.cell_count):
-            idx = base + (i * 2)
+            idx = off + base + (i * 2)
             ptr = int.from_bytes(self.raw_data[idx:idx + 2], 'big')
             self.cell_pointers.append(ptr)
 
@@ -116,7 +125,7 @@ class BTreePage:
 
     def _pointer_offset(self, index: int) -> int:
         header_size = 12 if self.page_type in (PT_INTERIOR_TABLE, PT_INTERIOR_INDEX) else 8
-        return header_size + (index * 2)
+        return self.b_tree_offset + header_size + (index * 2)
 
     def _allocate_space(self, size: int) -> int:
         offset = self._freeblock_alloc(size)
