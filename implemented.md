@@ -86,10 +86,10 @@
 ## Phase 6: Transaction & Concurrency
 
 ```
-[ ] 6.1 Transaction manager (BEGIN/COMMIT/ROLLBACK)
-[ ] 6.2 Lock protocol (5-state)
-[ ] 6.3 Savepoints (nested, rollback to, release)
-[ ] 6.4 Foreign key enforcement (immediate/deferred)
+[x] 6.1 Transaction manager (BEGIN/COMMIT/ROLLBACK)
+[x] 6.2 Lock protocol (5-state)
+[x] 6.3 Savepoints (nested, rollback to, release)
+[-] 6.4 Foreign key enforcement (immediate/deferred)
 [ ] 6.5 CASCADE / SET NULL / SET DEFAULT / RESTRICT
 [ ] 6.6 Busy handler
 ```

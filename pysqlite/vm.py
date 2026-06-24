@@ -80,6 +80,8 @@ class VM:
         self.explain_mode: bool = False
         self._current_row: list[Register] = []
         self._affinity_cache: dict[str, int] = {}
+        from pysqlite.transaction import TransactionManager
+        self.tx = TransactionManager(self.pager, self.pager.vfs, self.pager.handle)
 
     def run(self, program: list[Instruction]) -> list[list]:
         self.program = program
@@ -831,13 +833,20 @@ class VM:
 
     def _op_Transaction(self, P1: int, P2: int, P3: int, P4: Any, P5: int):
         if P1 == 0:
-            pass  # Read transaction
+            self.tx.commit()
         elif P1 == 1:
-            pass  # Write transaction — begin
+            self.tx.begin_write()
         elif P1 == -1:
-            from pysqlite.pager import Pager
-            if hasattr(self.pager, 'rollback'):
-                self.pager.rollback()
+            self.tx.rollback()
+
+    def _op_Savepoint(self, P1: int, P2: int, P3: int, P4: Any, P5: int):
+        self.tx.savepoint(P4)
+
+    def _op_Release(self, P1: int, P2: int, P3: int, P4: Any, P5: int):
+        self.tx.release(P4)
+
+    def _op_RollbackTo(self, P1: int, P2: int, P3: int, P4: Any, P5: int):
+        self.tx.rollback_to(P4)
 
     # ── DDL ──
 
