@@ -100,7 +100,7 @@
 [x] 7.1 Aggregate functions (COUNT, SUM, AVG, MIN, MAX, GROUP_CONCAT, TOTAL) + GROUP BY + HAVING
 [x] 7.2 Scalar functions (LENGTH, UPPER, LOWER — via SQL integration tests)
 [x] 7.3 Numeric functions (ABS — via SQL integration tests)
-[ ] 7.4 Math functions (ACOS, SIN, COS, LOG, SQRT, PI, etc.)
+[x] 7.4 Math functions (ACOS, SIN, COS, LOG, SQRT, PI, POWER, RAND, etc.)
 [ ] 7.5 Date/time functions (DATE, TIME, DATETIME, JULIANDAY, STRFTIME)
 [ ] 7.6 JSON functions (json_extract, json_set, json_array, etc.)
 [ ] 7.7 Window functions (ROW_NUMBER, RANK, LAG, LEAD, NTILE, etc.)

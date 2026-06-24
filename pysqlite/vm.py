@@ -795,6 +795,39 @@ class VM:
         if name_upper == 'ZEROBLOB':
             n = int(args[0]) if args and args[0] is not None else 0
             return b'\x00' * n
+        import math
+        if name_upper == 'SIN':
+            return math.sin(float(args[0])) if args else None
+        if name_upper == 'COS':
+            return math.cos(float(args[0])) if args else None
+        if name_upper == 'TAN':
+            return math.tan(float(args[0])) if args else None
+        if name_upper == 'ASIN':
+            return math.asin(float(args[0])) if args else None
+        if name_upper == 'ACOS':
+            return math.acos(float(args[0])) if args else None
+        if name_upper == 'ATAN':
+            return math.atan(float(args[0])) if args else None
+        if name_upper == 'CEIL':
+            return math.ceil(float(args[0])) if args else None
+        if name_upper == 'FLOOR':
+            return math.floor(float(args[0])) if args else None
+        if name_upper == 'ROUND':
+            return round(float(args[0])) if args else None
+        if name_upper == 'LOG':
+            return math.log(float(args[0])) if args else None
+        if name_upper == 'LOG10':
+            return math.log10(float(args[0])) if args else None
+        if name_upper == 'SQRT':
+            return math.sqrt(float(args[0])) if args else None
+        if name_upper == 'EXP':
+            return math.exp(float(args[0])) if args else None
+        if name_upper == 'PI':
+            return math.pi
+        if name_upper in ('POWER', 'POW'):
+            return math.pow(float(args[0]), float(args[1])) if len(args) >= 2 else None
+        if name_upper == 'RAND':
+            return random.random() * 2 - 1
         if not args:
             return None
         return args[0]
