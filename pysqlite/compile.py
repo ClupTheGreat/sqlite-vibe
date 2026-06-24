@@ -10,7 +10,7 @@ from pysqlite.ast import (
     Statement, Expr,
     Select, Insert, Update, Delete,
     CreateTable, CreateIndex, DropTable, DropIndex,
-    CreateView, CreateTrigger, AlterTable,
+    CreateView, DropView, CreateTrigger, AlterTable,
     Begin, Commit, RollbackStmt, Savepoint, Release,
     Pragma, Explain,
     Literal, NullLiteral, ColumnRef, UnaryOp, BinaryOp,
@@ -161,6 +161,10 @@ class Compiler:
             self._compile_rollback(statement)
         elif isinstance(statement, Pragma):
             self._compile_pragma(statement)
+        elif isinstance(statement, CreateView):
+            self._compile_create_view(statement)
+        elif isinstance(statement, DropView):
+            self._compile_drop_view(statement)
         elif isinstance(statement, Explain):
             self._compile_explain(statement)
         else:
@@ -471,6 +475,7 @@ class Compiler:
     # ── SELECT ──
 
     def _compile_select(self, node: Select):
+        self._expand_views(node)
         if node.ctes:
             self._compile_cte(node.ctes)
         cursor = self.alloc_cursor()
@@ -569,6 +574,7 @@ class Compiler:
             self._compile_compound(node)
 
     def _compile_aggregation(self, node: Select, cursor: int):
+        self._expand_views(node)
         if node.from_clause:
             table_ref = node.from_clause[0]
             if isinstance(table_ref, TableName):
@@ -918,6 +924,97 @@ class Compiler:
         self.emit(Opcode.DropIndex, P1=0, P4=node.name,
                   comment=f'DROP INDEX {node.name}')
 
+    def _compile_create_view(self, node: CreateView):
+        self.emit(Opcode.Transaction, P1=1, comment='DDL begin write')
+        sql = f"CREATE VIEW {node.name.name} AS {self._reconstruct_select_sql(node.select)}"
+        from pysqlite.schema import ViewDef
+        vd = ViewDef(name=node.name.name, sql=sql, select=node.select)
+        if self.schema:
+            self.schema.views[node.name.name] = vd
+            from pysqlite.btree import BTree
+            btree = BTree(self.db, 1, is_table=True)
+            self.schema._insert_schema_entry(
+                btree, type_='view', name=node.name.name,
+                tbl_name=node.name.name, rootpage=0, sql=sql,
+            )
+        self.emit(Opcode.CreateTable, P1=0, P4=node.name.name,
+                  comment=f'CREATE VIEW {node.name.name}')
+
+    def _compile_drop_view(self, node: DropView):
+        self.emit(Opcode.Transaction, P1=1, comment='DDL begin write')
+        if self.schema:
+            self.schema.views.pop(node.name, None)
+        self.emit(Opcode.DropTable, P1=0, P4=node.name,
+                  comment=f'DROP VIEW {node.name}')
+
+    def _reconstruct_select_sql(self, select: Select) -> str:
+        parts = ['SELECT']
+        if select.distinct:
+            parts.append('DISTINCT')
+        col_strs = []
+        for rc in select.columns:
+            col_strs.append(self._expr_to_sql(rc.expr))
+        parts.append(', '.join(col_strs))
+        if select.from_clause:
+            parts.append('FROM')
+            from_strs = []
+            for ref in select.from_clause:
+                if isinstance(ref, TableName):
+                    from_strs.append(ref.name)
+                elif isinstance(ref, SubqueryTable):
+                    from_strs.append(f'({self._reconstruct_select_sql(ref.select)})')
+                else:
+                    from_strs.append(str(ref))
+            parts.append(' '.join(from_strs))
+        if select.where:
+            parts.append('WHERE')
+            parts.append(self._expr_to_sql(select.where))
+        if select.group_by:
+            parts.append('GROUP BY')
+            parts.append(', '.join(self._expr_to_sql(g) for g in select.group_by))
+        if select.having:
+            parts.append('HAVING')
+            parts.append(self._expr_to_sql(select.having))
+        if select.order_by:
+            parts.append('ORDER BY')
+            parts.append(', '.join(self._ordering_to_sql(o) for o in select.order_by))
+        if select.limit:
+            parts.append(f'LIMIT {self._expr_to_sql(select.limit)}')
+        if select.offset:
+            parts.append(f'OFFSET {self._expr_to_sql(select.offset)}')
+        return ' '.join(parts)
+
+    def _expr_to_sql(self, expr: Expr) -> str:
+        if isinstance(expr, Literal):
+            v = expr.value
+            if v is None:
+                return 'NULL'
+            if isinstance(v, str):
+                return f"'{v}'"
+            return str(v)
+        if isinstance(expr, ColumnRef):
+            if expr.table:
+                return f'{expr.table}.{expr.name}'
+            return expr.name
+        if isinstance(expr, StarExpr):
+            return '*'
+        if isinstance(expr, BinaryOp):
+            return f'({self._expr_to_sql(expr.left)} {expr.op} {self._expr_to_sql(expr.right)})'
+        if isinstance(expr, FunctionCall):
+            args = ', '.join(self._expr_to_sql(a) for a in expr.args)
+            return f'{expr.name}({args})'
+        return str(expr)
+
+    def _ordering_to_sql(self, o: OrderingTerm) -> str:
+        sql = self._expr_to_sql(o.expr)
+        if o.direction == 'DESC':
+            sql += ' DESC'
+        if o.nulls == 'FIRST':
+            sql += ' NULLS FIRST'
+        elif o.nulls == 'LAST':
+            sql += ' NULLS LAST'
+        return sql
+
     # ── Transactions ──
 
     def _compile_begin(self, node: Begin):
@@ -957,6 +1054,151 @@ class Compiler:
 
     def _compile_cte(self, ctes: list[CTE]):
         pass  # Placeholder — will implement when needed
+
+    # ── View expansion ──
+
+    def _get_view_select(self, view) -> Select | None:
+        select = view.select
+        if select is not None:
+            return select
+        from pysqlite.parser import Parser
+        from pysqlite.lexer import Lexer
+        try:
+            tokens = Lexer(view.sql).tokenize()
+            stmts = Parser(tokens).parse()
+            for s in stmts:
+                if isinstance(s, CreateView):
+                    view.select = s.select
+                    return s.select
+        except Exception:
+            pass
+        return None
+
+    def _build_view_col_map(self, select: Select) -> dict[str, Expr]:
+        """Map view column names to their defining expressions."""
+        mapping = {}
+        for i, rc in enumerate(select.columns):
+            if isinstance(rc.expr, StarExpr):
+                continue
+            name = rc.alias
+            if name is None and isinstance(rc.expr, ColumnRef):
+                name = rc.expr.name
+            if name is None:
+                name = str(i)
+            mapping[name.upper()] = rc.expr
+        return mapping
+
+    def _rewrite_col_ref(self, expr: Expr, view_col_map: dict[str, Expr],
+                         view_alias: str | None) -> Expr:
+        """Replace ColumnRef expressions that reference view columns with view expressions."""
+        from copy import deepcopy
+        if isinstance(expr, ColumnRef):
+            ref_name = expr.name.upper()
+            ref_table = expr.table.upper() if expr.table else ''
+            view_upper = view_alias.upper() if view_alias else ''
+            if ref_table and ref_table != view_upper:
+                return expr
+            if ref_name in view_col_map:
+                return deepcopy(view_col_map[ref_name])
+            return expr
+        if isinstance(expr, UnaryOp):
+            return UnaryOp(op=expr.op, operand=self._rewrite_col_ref(expr.operand, view_col_map, view_alias))
+        if isinstance(expr, BinaryOp):
+            return BinaryOp(
+                op=expr.op,
+                left=self._rewrite_col_ref(expr.left, view_col_map, view_alias),
+                right=self._rewrite_col_ref(expr.right, view_col_map, view_alias),
+            )
+        if isinstance(expr, FunctionCall):
+            return FunctionCall(
+                name=expr.name,
+                args=[self._rewrite_col_ref(a, view_col_map, view_alias) for a in expr.args],
+                star=expr.star,
+                distinct=expr.distinct,
+            )
+        if isinstance(expr, IsOp):
+            return IsOp(
+                left=self._rewrite_col_ref(expr.left, view_col_map, view_alias),
+                right=self._rewrite_col_ref(expr.right, view_col_map, view_alias),
+                negated=expr.negated,
+            )
+        if isinstance(expr, LikeOp):
+            return LikeOp(
+                left=self._rewrite_col_ref(expr.left, view_col_map, view_alias),
+                right=self._rewrite_col_ref(expr.right, view_col_map, view_alias),
+                escape=self._rewrite_col_ref(expr.escape, view_col_map, view_alias) if expr.escape else None,
+                negated=expr.negated,
+            )
+        return expr
+
+    def _expand_views(self, node: Select):
+        """Replace TableName references to views with underlying tables and rewrite columns."""
+        if not node.from_clause:
+            return
+        expanded = []
+        view_col_maps: list[tuple[dict[str, Expr], str | None]] = []
+        for ref in node.from_clause:
+            if isinstance(ref, TableName) and self.schema is not None:
+                view = self.schema.get_view(ref.name)
+                if view is not None:
+                    select = self._get_view_select(view)
+                    if select is not None and select.from_clause:
+                        alias = ref.alias or ref.name
+                        vcm = self._build_view_col_map(select)
+                        view_col_maps.append((vcm, alias))
+                        for inner_ref in select.from_clause:
+                            if isinstance(inner_ref, TableName):
+                                new_ref = TableName(name=inner_ref.name, schema=inner_ref.schema)
+                                new_ref.alias = alias
+                                expanded.append(new_ref)
+                            else:
+                                expanded.append(inner_ref)
+                        continue
+            expanded.append(ref)
+
+        if not view_col_maps:
+            return
+
+        # Merge view WHERE clauses into the outer query
+        for ref in node.from_clause:
+            if isinstance(ref, TableName) and self.schema is not None:
+                view = self.schema.get_view(ref.name)
+                if view is not None:
+                    select = self._get_view_select(view)
+                    if select is not None and select.where:
+                        view_where_alias = ref.alias or ref.name
+                        rewritten_where = self._rewrite_col_ref(select.where, {}, None)
+                        if node.where:
+                            node.where = BinaryOp(op='AND', left=rewritten_where, right=node.where)
+                        else:
+                            node.where = rewritten_where
+
+        node.from_clause = expanded
+
+        # Build composite column map (merge all view column maps)
+        composite_map: dict[str, Expr] = {}
+        for vcm, alias in view_col_maps:
+            composite_map.update(vcm)
+
+        # Rewrite column references in the outer query
+        new_columns = []
+        for rc in node.columns:
+            if isinstance(rc.expr, StarExpr):
+                new_columns.append(rc)
+            else:
+                new_expr = self._rewrite_col_ref(rc.expr, composite_map, None)
+                new_columns.append(ResultColumn(expr=new_expr, alias=rc.alias))
+        node.columns = new_columns
+
+        if node.where:
+            node.where = self._rewrite_col_ref(node.where, composite_map, None)
+        if node.group_by:
+            node.group_by = [self._rewrite_col_ref(g, composite_map, None) for g in node.group_by]
+        if node.having:
+            node.having = self._rewrite_col_ref(node.having, composite_map, None)
+        if node.order_by:
+            for ot in node.order_by:
+                ot.expr = self._rewrite_col_ref(ot.expr, composite_map, None)
 
     # ── Schema lookups ──
 

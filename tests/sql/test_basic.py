@@ -363,6 +363,51 @@ class TestDateTimeFunctions:
         assert res[0][0] == '2024-01-01 12:30:00'
 
 
+class TestViews:
+    def test_create_view_and_select(self, db):
+        db.execute('CREATE TABLE t (a INT, b INT)')
+        db.execute("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)")
+        db.execute("CREATE VIEW v AS SELECT a, b FROM t")
+        res = db.execute("SELECT * FROM v")
+        assert len(res) == 3
+        assert res[0] == [1, 10]
+        assert res[1] == [2, 20]
+        assert res[2] == [3, 30]
+
+    def test_create_view_with_filter(self, db):
+        db.execute('CREATE TABLE t (a INT, b INT)')
+        db.execute("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)")
+        db.execute("CREATE VIEW v AS SELECT a, b FROM t WHERE a > 1")
+        res = db.execute("SELECT * FROM v")
+        assert len(res) == 2
+        assert res[0] == [2, 20]
+        assert res[1] == [3, 30]
+
+    def test_create_view_column_select(self, db):
+        db.execute('CREATE TABLE t (a INT, b INT)')
+        db.execute("INSERT INTO t VALUES (1, 10), (2, 20)")
+        db.execute("CREATE VIEW v AS SELECT a, b FROM t")
+        res = db.execute("SELECT a FROM v")
+        assert res == [[1], [2]]
+
+    def test_create_view_expression(self, db):
+        db.execute('CREATE TABLE t (a INT, b INT)')
+        db.execute("INSERT INTO t VALUES (1, 10), (2, 20)")
+        db.execute("CREATE VIEW v AS SELECT a * 2 AS double_a FROM t")
+        res = db.execute("SELECT double_a FROM v")
+        assert res == [[2], [4]]
+
+    def test_drop_view(self, db):
+        db.execute('CREATE TABLE t (a INT)')
+        db.execute("INSERT INTO t VALUES (1)")
+        db.execute("CREATE VIEW v AS SELECT a FROM t")
+        res = db.execute("SELECT * FROM v")
+        assert res == [[1]]
+        assert db.schema.get_view('v') is not None
+        db.execute("DROP VIEW v")
+        assert db.schema.get_view('v') is None
+
+
 class TestTransactions:
     def test_begin_commit(self, db):
         db.execute('CREATE TABLE t (a INT)')

@@ -104,7 +104,7 @@
 [x] 7.5 Date/time functions (DATE, TIME, DATETIME, JULIANDAY, STRFTIME, UNIXEPOCH)
 [ ] 7.6 JSON functions (json_extract, json_set, json_array, etc.)
 [ ] 7.7 Window functions (ROW_NUMBER, RANK, LAG, LEAD, NTILE, etc.)
-[ ] 7.8 Views (CREATE/DROP, expansion)
+[x] 7.8 Views (CREATE/DROP, expansion with column rewriting)
 [ ] 7.9 Triggers (BEFORE/AFTER/INSTEAD OF, OLD/NEW)
 [ ] 7.10 UPSERT (ON CONFLICT DO NOTHING/UPDATE)
 [ ] 7.11 RETURNING clause
@@ -132,7 +132,7 @@
 
 ```
 [ ] 9.1 Unit tests (all modules)
-[x] 9.2 SQL integration tests (68 end-to-end tests: DDL, DML, SELECT, expressions, ORDER BY, functions, aggregation, GROUP BY, HAVING, math, date/time, transactions)
+[x] 9.2 SQL integration tests (73 end-to-end tests: DDL, DML, SELECT, expressions, ORDER BY, functions, aggregation, GROUP BY, HAVING, math, date/time, views, transactions)
 [ ] 9.3 Compatibility tests (against real sqlite3)
 [ ] 9.4 Stress tests (large data, transactions)
 [ ] 9.5 Fuzz tests (random SQL, corrupt DB)

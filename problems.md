@@ -269,6 +269,20 @@ When you encounter a problem during development, add an entry like:
     strips hidden columns. HAVING is evaluated via serialized expression
     tree. Register ordering pitfall: visible columns must be compiled
     before hidden columns so ResultRow outputs them in the correct order.
+
+[2026-06-25] Views (CREATE/DROP VIEW + expansion) implemented
+  - File: pysqlite/compile.py:1051-1187, pysqlite/schema.py:280-285 (new)
+  - Severity: low (new feature, minor limitations)
+  - Details: CREATE/DROP VIEW with automatic expansion in SELECT FROM clause.
+    View expansion replaces the view TableName with underlying tables and
+    rewrites column references in outer query (WHERE, GROUP BY, HAVING,
+    ORDER BY) to use the view's defining expressions. View WHERE clauses
+    are merged into the outer query via AND. Limitations: (1) DROP VIEW
+    only removes from in-memory Schema dict, not from sqlite_schema B-Tree
+    (same limitation as DROP TABLE/DROP INDEX). (2) SubqueryTable in FROM
+    compiling is still broken (inlines sub-program with Halt, terminating VM).
+    Views avoid this by doing column-level AST rewriting instead of
+    SubqueryTable expansion.
 ```
 
 

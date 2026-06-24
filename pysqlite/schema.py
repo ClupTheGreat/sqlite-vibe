@@ -286,6 +286,14 @@ class Schema:
         self.indexes.pop(name, None)
         self._bump_cookie()
 
+    def add_view(self, view_def: ViewDef):
+        self.views[view_def.name] = view_def
+        self._bump_cookie()
+
+    def drop_view(self, name: str):
+        self.views.pop(name, None)
+        self._bump_cookie()
+
     def _bump_cookie(self):
         self.schema_cookie += 1
         self.schema_version += 1
