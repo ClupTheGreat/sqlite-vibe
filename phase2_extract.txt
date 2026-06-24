@@ -1,0 +1,1120 @@
+## 4. Phase 2: Record & B-Tree Engine
+
+### 4.1 Cell Format (`cell.py`)
+
+Cells are the fundamental unit of data within B-Tree pages. There are four cell types corresponding to the four page types.
+
+**Table Leaf Cell:**
+
+```
+[varint: payload_length]
+[varint: rowid]
+[bytes: payload]   // the actual record data
+```
+
+The payload_length is the byte count of the payload. The rowid is the integer key (64-bit). The payload is the serialized record.
+
+**Table Interior Cell:**
+
+```
+[varint: left_child_page]  // page number of left subtree
+[varint: key]              // separator key (rowid)
+```
+
+**Index Leaf Cell:**
+
+```
+[varint: payload_length]
+[bytes: payload]  // the indexed columns as a record (no rowid unless included)
+```
+
+**Index Interior Cell:**
+
+```
+[varint: left_child_page]
+[varint: payload_length]
+[bytes: payload]
+```
+
+**Cell Overflow:**
+
+When a cell's payload exceeds about 25% of page size, it's stored as overflow:
+- The first part is stored inline in the cell
+- The rest is stored on overflow pages chained together
+
+Maximum local payload = ((page_size - cell_offset) * max_embedded / 100) - 4
+Where max_embedded = page[21] (default 64, meaning 64% of usable space)
+
+Overflow page format:
+```
+[4 bytes: next_overflow_page (0 if last)]
+[usable_size - 4 bytes: overflow data]
+```
+
+**Cell Implementation:**
+
+```python
+class Cell:
+    """Base class for all cell types."""
+    __slots__ = ()
+    
+    def serialize(self) -> bytes:
+        raise NotImplementedError
+    
+    @classmethod
+    def parse(cls, data: bytes, page_type: int) -> 'Cell':
+        raise NotImplementedError
+
+class TableLeafCell(Cell):
+    __slots__ = ('payload_length', 'rowid', 'payload')
+    
+    def __init__(self, rowid: int, payload: bytes):
+        self.rowid = rowid
+        self.payload = payload
+        self.payload_length = len(payload)
+    
+    def serialize(self) -> bytes:
+        return encode_varint(self.payload_length) + encode_varint(self.rowid) + self.payload
+    
+    @classmethod
+    def parse(cls, data: bytes) -> 'TableLeafCell':
+        offset = 0
+        payload_length, consumed = decode_varint(data, offset)
+        offset += consumed
+        rowid, consumed = decode_varint(data, offset)
+        offset += consumed
+        payload = data[offset:offset + payload_length]
+        return cls(rowid, payload)
+
+class TableInteriorCell(Cell):
+    __slots__ = ('left_child_page', 'key')
+    
+    def __init__(self, left_child_page: int, key: int):
+        self.left_child_page = left_child_page
+        self.key = key
+    
+    def serialize(self) -> bytes:
+        return encode_varint(self.left_child_page) + encode_varint(self.key)
+    
+    @classmethod
+    def parse(cls, data: bytes) -> 'TableInteriorCell':
+        offset = 0
+        left_child, consumed = decode_varint(data, offset)
+        offset += consumed
+        key, consumed = decode_varint(data, offset)
+        return cls(left_child, key)
+
+class IndexLeafCell(Cell):
+    __slots__ = ('payload_length', 'payload')
+    
+    def __init__(self, payload: bytes):
+        self.payload = payload
+        self.payload_length = len(payload)
+    
+    def serialize(self) -> bytes:
+        return encode_varint(self.payload_length) + self.payload
+    
+    @classmethod
+    def parse(cls, data: bytes) -> 'IndexLeafCell':
+        offset = 0
+        payload_length, consumed = decode_varint(data, offset)
+        offset += consumed
+        payload = data[offset:offset + payload_length]
+        return cls(payload)
+
+class IndexInteriorCell(Cell):
+    __slots__ = ('left_child_page', 'payload_length', 'payload')
+    
+    def __init__(self, left_child_page: int, payload: bytes):
+        self.left_child_page = left_child_page
+        self.payload = payload
+        self.payload_length = len(payload)
+    
+    def serialize(self) -> bytes:
+        return (encode_varint(self.left_child_page) +
+                encode_varint(self.payload_length) +
+                self.payload)
+    
+    @classmethod
+    def parse(cls, data: bytes) -> 'IndexInteriorCell':
+        offset = 0
+        left_child, consumed = decode_varint(data, offset)
+        offset += consumed
+        payload_length, consumed = decode_varint(data, offset)
+        offset += consumed
+        payload = data[offset:offset + payload_length]
+        return cls(left_child, payload)
+```
+
+### 4.2 Record Encoding (`record.py`)
+
+**Serial Type System:**
+
+SQLite uses a compact self-describing format where each column's type and size are encoded in a single varint called the "serial type."
+
+**Serial Type Encoding:**
+
+```
+Type Codes:
+0  → NULL value (0 bytes)
+1  → signed 8-bit integer (1 byte, big-endian twos complement)
+2  → signed 16-bit integer (2 bytes)
+3  → signed 24-bit integer (3 bytes)
+4  → signed 32-bit integer (4 bytes)
+5  → signed 48-bit integer (6 bytes)
+6  → signed 64-bit integer (8 bytes)
+7  → IEEE 754 64-bit float (8 bytes, big-endian)
+8  → integer 0 (0 bytes, implicit value 0)
+9  → integer 1 (0 bytes, implicit value 1)
+10 → reserved
+11 → reserved
+12+ even → BLOB of (type-12)/2 bytes
+13+ odd  → TEXT of (type-13)/2 bytes
+```
+
+**Record Format:**
+
+```
+[varint: header_size]           // total byte count of serial types array
+[varint: serial_type_1]
+[varint: serial_type_2]
+  ...
+[varint: serial_type_N]
+[bytes: value_1]
+[bytes: value_2]
+  ...
+[bytes: value_N]
+```
+
+**Implementation:**
+
+```python
+import struct
+
+class Record:
+    __slots__ = ('columns',)
+    
+    def __init__(self, columns: list[tuple[int, Any]]):
+        """
+        columns: list of (serial_type, value) pairs.
+        serial_type can be computed automatically from value.
+        """
+        self.columns = columns
+    
+    @staticmethod
+    def serial_type(value) -> int:
+        """Determine the serial type code for a Python value."""
+        if value is None:
+            return 0
+        if isinstance(value, bool):
+            return 1 if value else 0  # bool is int subclass; 8-bit
+        if isinstance(value, int):
+            if value == 0:
+                return 8
+            if value == 1:
+                return 9
+            if -128 <= value <= 127:
+                return 1
+            if -32768 <= value <= 32767:
+                return 2
+            if -8388608 <= value <= 8388607:
+                return 3
+            if -2147483648 <= value <= 2147483647:
+                return 4
+            if -140737488355328 <= value <= 140737488355327:
+                return 5
+            return 6
+        if isinstance(value, float):
+            return 7
+        if isinstance(value, (bytes, bytearray)):
+            length = len(value)
+            return 12 + 2 * length
+        if isinstance(value, str):
+            encoded = value.encode('utf-8')
+            length = len(encoded)
+            return 13 + 2 * length
+        raise ValueError(f"Cannot serialize type: {type(value)}")
+    
+    @staticmethod
+    def serial_type_to_bytes(st: int, value) -> bytes:
+        """Convert a Python value to raw bytes given its serial type."""
+        if st == 0:  # NULL
+            return b''
+        if st == 1:  # INT8
+            return struct.pack('>b', value)
+        if st == 2:  # INT16
+            return struct.pack('>h', value)
+        if st == 3:  # INT24
+            if value < 0:
+                value += 1 << 24
+            return value.to_bytes(3, 'big')
+        if st == 4:  # INT32
+            return struct.pack('>i', value)
+        if st == 5:  # INT48
+            if value < 0:
+                value += 1 << 48
+            return value.to_bytes(6, 'big')
+        if st == 6:  # INT64
+            return struct.pack('>q', value)
+        if st == 7:  # FLOAT64
+            return struct.pack('>d', value)
+        if st == 8:  # ZERO
+            return b''
+        if st == 9:  # ONE
+            return b''
+        if st >= 12 and st % 2 == 0:  # BLOB
+            length = (st - 12) // 2
+            if isinstance(value, str):
+                value = value.encode('utf-8')
+            return bytes(value[:length])
+        if st >= 13 and st % 2 == 1:  # TEXT
+            length = (st - 13) // 2
+            if isinstance(value, str):
+                encoded = value.encode('utf-8')
+            else:
+                encoded = str(value).encode('utf-8')
+            return encoded[:length]
+        raise ValueError(f"Unknown serial type: {st}")
+    
+    @staticmethod
+    def bytes_to_value(st: int, data: bytes) -> Any:
+        """Convert raw bytes back to a Python value given serial type."""
+        if st == 0:
+            return None
+        if st == 1:
+            return struct.unpack('>b', data)[0]
+        if st == 2:
+            return struct.unpack('>h', data)[0]
+        if st == 3:
+            val = int.from_bytes(data, 'big')
+            if val >= 1 << 23:
+                val -= 1 << 24
+            return val
+        if st == 4:
+            return struct.unpack('>i', data)[0]
+        if st == 5:
+            val = int.from_bytes(data, 'big')
+            if val >= 1 << 47:
+                val -= 1 << 48
+            return val
+        if st == 6:
+            return struct.unpack('>q', data)[0]
+        if st == 7:
+            return struct.unpack('>d', data)[0]
+        if st == 8:
+            return 0
+        if st == 9:
+            return 1
+        if st >= 12 and st % 2 == 0:
+            return data  # BLOB
+        if st >= 13 and st % 2 == 1:
+            return data.decode('utf-8')  # TEXT
+        raise ValueError(f"Unknown serial type: {st}")
+    
+    def encode(self) -> bytes:
+        """Serialize the record to bytes."""
+        serial_types = []
+        values_bytes = b''
+        for st, value in self.columns:
+            serial_types.append(st)
+            values_bytes += self.serial_type_to_bytes(st, value)
+        
+        # Compute header
+        header_data = b''
+        for st in serial_types:
+            header_data += encode_varint(st)
+        
+        header_length = len(header_data)
+        result = encode_varint(header_length + 1)  # +1 for the header_size varint itself
+        result += header_data
+        result += values_bytes
+        return result
+    
+    @classmethod
+    def decode(cls, data: bytes, offset: int = 0) -> tuple['Record', int]:
+        """
+        Decode a record from bytes.
+        Returns (Record, bytes_consumed).
+        """
+        header_size, consumed = decode_varint(data, offset)
+        offset += consumed
+        header_end = offset + header_size - 1  # -1 because header_size includes the size varint
+        
+        serial_types = []
+        while offset < header_end:
+            st, consumed = decode_varint(data, offset)
+            serial_types.append(st)
+            offset += consumed
+        
+        values = []
+        for st in serial_types:
+            if st == 0:
+                values.append((st, None))
+            elif st == 8:
+                values.append((st, 0))
+            elif st == 9:
+                values.append((st, 1))
+            elif st < 8:  # 1-7: fixed-size
+                size = [0, 1, 2, 3, 4, 6, 8][st]
+                val_data = data[offset:offset + size]
+                values.append((st, cls.bytes_to_value(st, val_data)))
+                offset += size
+            elif st >= 12:
+                if st % 2 == 0:  # BLOB
+                    size = (st - 12) // 2
+                else:  # TEXT
+                    size = (st - 13) // 2
+                val_data = data[offset:offset + size]
+                values.append((st, cls.bytes_to_value(st, val_data)))
+                offset += size
+        
+        return cls(values), offset
+    
+    def get_values(self) -> list[Any]:
+        """Return just the Python values without serial type info."""
+        return [v for _, v in self.columns]
+```
+
+### 4.3 B-Tree (`btree.py`)
+
+**Page Layout:**
+
+Each database page (header page aside) is one of four B-Tree page types. The layout within a page:
+
+```
+|-----------------------|
+| Page Header (8-12b)   |
+|-----------------------|
+| Cell Pointer Array    |
+| (2 bytes per cell)    |
+| ...                   |
+|-----------------------|
+| Free Space            |
+| ...                   |
+|-----------------------|
+| Unallocated Space     |
+| ...                   |
+|-----------------------|
+| Cell Content           |
+| (grows downward)      |
+|-----------------------|
+```
+
+**Page Header Format:**
+
+**Leaf Table Page (0x0D):**
+```
+Offset  Size  Field
+0       1     Page type (0x0D)
+1       2     First freeblock offset (0 if none)
+3       2     Number of cells
+5       2     Start of cell content area
+7       1     Fragmented free bytes count
+8       4     Rightmost child page (for interior pages only)
+```
+
+**Interior Table Page (0x05):**
+Same header + 4 bytes: rightmost child page number (offset 8-11).
+
+**Leaf Index Page (0x0A):**
+Same as leaf table, but no rightmost child.
+
+**Interior Index Page (0x02):**
+Same as interior table (has rightmost child).
+
+**Cell Pointer Array:**
+
+An array of 2-byte integers (big-endian), each pointing to the byte offset of a cell within the page. Pointers are stored in key order (ascending by rowid for tables, by key for indexes).
+
+**Freeblock Chain:**
+
+When cells are deleted, their space is tracked via a linked list of freeblocks within the page:
+```
+[2 bytes: next freeblock offset (0 if end)]
+[2 bytes: size of this freeblock]
+```
+
+**Implementation:**
+
+```python
+class BTreePage:
+    __slots__ = (
+        'pager', 'page_number', 'page_type', 'first_freeblock',
+        'cell_count', 'cell_content_offset', 'fragmented_free_bytes',
+        'right_child', 'cell_pointers', 'raw_data', 'dirty'
+    )
+    
+    def __init__(self, pager: 'Pager', page_number: int):
+        self.pager = pager
+        self.page_number = page_number
+        self.raw_data = bytearray(pager.read_page(page_number))
+        self.dirty = False
+        self._parse_header()
+        self._parse_cell_pointers()
+    
+    def _parse_header(self):
+        data = self.raw_data
+        self.page_type = data[0]
+        self.first_freeblock = int.from_bytes(data[1:3], 'big')
+        self.cell_count = int.from_bytes(data[3:5], 'big')
+        self.cell_content_offset = int.from_bytes(data[5:7], 'big')
+        self.fragmented_free_bytes = data[7]
+        
+        if self.page_type in (PT_INTERIOR_TABLE, PT_INTERIOR_INDEX):
+            self.right_child = int.from_bytes(data[8:12], 'big')
+        else:
+            self.right_child = 0
+    
+    def _write_header(self):
+        data = self.raw_data
+        data[0] = self.page_type
+        data[1:3] = self.first_freeblock.to_bytes(2, 'big')
+        data[3:5] = self.cell_count.to_bytes(2, 'big')
+        data[5:7] = self.cell_content_offset.to_bytes(2, 'big')
+        data[7] = self.fragmented_free_bytes
+        
+        if self.page_type in (PT_INTERIOR_TABLE, PT_INTERIOR_INDEX):
+            data[8:12] = self.right_child.to_bytes(4, 'big')
+    
+    def _parse_cell_pointers(self):
+        """Read the cell pointer array at the start of the page."""
+        self.cell_pointers = []
+        for i in range(self.cell_count):
+            offset = 8 if self.page_type in (PT_INTERIOR_TABLE, PT_INTERIOR_INDEX) else 8
+            idx = offset + (i * 2)
+            ptr = int.from_bytes(self.raw_data[idx:idx+2], 'big')
+            self.cell_pointers.append(ptr)
+    
+    def read_cell(self, index: int) -> bytes:
+        """Read the raw bytes of cell at given index."""
+        if index < 0 or index >= self.cell_count:
+            raise IndexError(f"Cell index {index} out of range")
+        ptr = self.cell_pointers[index]
+        end_ptr = self._find_cell_end(index)
+        return bytes(self.raw_data[ptr:end_ptr])
+    
+    def _find_cell_end(self, index: int) -> int:
+        """Find where this cell's data ends (next cell start or free space)."""
+        if index + 1 < self.cell_count:
+            next_ptr = self.cell_pointers[index + 1]
+            # Cells stored in descending offset order
+            if next_ptr < self.cell_pointers[index]:
+                return next_ptr
+            # Descending: earlier index = higher offset
+            for i in range(self.cell_count - 1, -1, -1):
+                if self.cell_pointers[i] < self.cell_pointers[index]:
+                    return self.cell_pointers[i]
+        return self.cell_content_offset  # last cell goes to content area start
+    
+    def insert_cell(self, index: int, cell_data: bytes):
+        """Insert a cell at the given index position."""
+        # Defragment if needed
+        if self._needs_defrag():
+            self._defragment()
+        
+        # Find space for the cell
+        cell_offset = self._allocate_space(len(cell_data))
+        
+        # Write cell data
+        self.raw_data[cell_offset:cell_offset + len(cell_data)] = cell_data
+        
+        # Insert pointer
+        ptr_offset = self._pointer_offset(index)
+        # Shift existing pointers
+        next_ptr_offset = self._pointer_offset(self.cell_count)
+        for i in range(self.cell_count, index, -1):
+            src = self._pointer_offset(i - 1)
+            dst = self._pointer_offset(i)
+            self.raw_data[dst:dst+2] = self.raw_data[src:src+2]
+        
+        # Write new pointer
+        self.raw_data[ptr_offset:ptr_offset+2] = cell_offset.to_bytes(2, 'big')
+        self.cell_count += 1
+        self._write_header()
+        self.dirty = True
+    
+    def delete_cell(self, index: int):
+        """Remove a cell at given index. Its space becomes a freeblock."""
+        # Read the cell data
+        cell_data = self.read_cell(index)
+        cell_offset = self.cell_pointers[index]
+        cell_size = len(cell_data)
+        
+        # Add to freeblock chain
+        self._add_freeblock(cell_offset, cell_size)
+        
+        # Remove pointer
+        for i in range(index, self.cell_count - 1):
+            dst = self._pointer_offset(i)
+            src = self._pointer_offset(i + 1)
+            self.raw_data[dst:dst+2] = self.raw_data[src:src+2]
+        
+        self.cell_count -= 1
+        self.cell_pointers.pop(index)
+        self._write_header()
+        self.dirty = True
+    
+    def _pointer_offset(self, index: int) -> int:
+        """Get the byte offset in the page for cell pointer at index."""
+        header_size = 8 if self.page_type in (PT_INTERIOR_TABLE, PT_INTERIOR_INDEX) else 8
+        return header_size + (index * 2)
+    
+    def _allocate_space(self, size: int) -> int:
+        """Allocate space of given size. Returns offset where data starts."""
+        # Try freeblock first
+        offset = self._freeblock_alloc(size)
+        if offset != 0:
+            return offset
+        
+        # Allocate from the end of the cell content area
+        old_offset = self.cell_content_offset
+        new_offset = old_offset - size
+        if new_offset < self._pointer_offset(self.cell_count):
+            self._defragment()
+            return self._allocate_space(size)
+        self.cell_content_offset = new_offset
+        self._write_header()
+        self.dirty = True
+        return new_offset
+    
+    def _freeblock_alloc(self, size: int) -> int:
+        """
+        Try to allocate from a freeblock.
+        Returns the offset (0 if no suitable freeblock).
+        """
+        prev = 0
+        current = self.first_freeblock
+        while current != 0:
+            block_size = int.from_bytes(self.raw_data[current+2:current+4], 'big')
+            if block_size >= size:
+                # Found a block large enough
+                if block_size - size >= 4:
+                    # Split the block
+                    remaining = block_size - size
+                    new_off = current + size
+                    self.raw_data[new_off:new_off+2] = self.raw_data[current:current+2]  # next ptr
+                    self.raw_data[new_off+2:new_off+4] = remaining.to_bytes(2, 'big')
+                    if prev == 0:
+                        self.first_freeblock = new_off
+                    else:
+                        self.raw_data[prev:prev+2] = new_off.to_bytes(2, 'big')
+                else:
+                    # Use whole block
+                    if prev == 0:
+                        self.first_freeblock = int.from_bytes(self.raw_data[current:current+2], 'big')
+                    else:
+                        self.raw_data[prev:prev+2] = self.raw_data[current:current+2]
+                    size = block_size  # use entire block
+                
+                self._write_header()
+                self.dirty = True
+                return current
+            
+            prev = current
+            next_off = int.from_bytes(self.raw_data[current:current+2], 'big')
+            current = next_off
+        
+        return 0  # no suitable freeblock
+    
+    def _add_freeblock(self, offset: int, size: int):
+        """Add a freeblock to the chain."""
+        self.raw_data[offset:offset+2] = self.first_freeblock.to_bytes(2, 'big')
+        self.raw_data[offset+2:offset+4] = size.to_bytes(2, 'big')
+        self.first_freeblock = offset
+        if size < 4:
+            self.fragmented_free_bytes += size
+        self._write_header()
+        self.dirty = True
+    
+    def _needs_defrag(self) -> bool:
+        """Check if defragmentation is beneficial."""
+        # If fragmented free bytes > threshold, defrag
+        return self.fragmented_free_bytes > (self.cell_content_offset * 0.1)
+    
+    def _defragment(self):
+        """Compact all cells to contiguous space and reset freeblock chain."""
+        # Collect all cells in order
+        cells = []
+        for i in range(self.cell_count - 1, -1, -1):
+            cells.append(self.read_cell(i))
+        
+        # Calculate new layout: pointers at top, content at bottom
+        usable_space = self.cell_content_offset  # old content area start
+        new_content_end = usable_space
+        
+        # Write cells from bottom up
+        for i, cell_data in enumerate(cells):
+            size = len(cell_data)
+            new_offset = new_content_end - size
+            self.raw_data[new_offset:new_offset + size] = cell_data
+            # Update pointer (cells in reverse order, so last inserted (index 0) goes to bottom)
+            self.cell_pointers[self.cell_count - 1 - i] = new_offset
+            new_content_end = new_offset
+        
+        # Update cell pointers in page
+        for i in range(self.cell_count):
+            ptr_offset = self._pointer_offset(i)
+            self.raw_data[ptr_offset:ptr_offset+2] = self.cell_pointers[i].to_bytes(2, 'big')
+        
+        # Reset freeblock chain
+        self.first_freeblock = 0
+        self.fragmented_free_bytes = 0
+        self.cell_content_offset = new_content_end
+        
+        self._write_header()
+        self.dirty = True
+    
+    def flush(self):
+        """Write the page back to disk if dirty."""
+        if self.dirty:
+            self._write_header()
+            self.pager.write_page(self.page_number, bytes(self.raw_data))
+            self.dirty = False
+    
+    def is_leaf(self) -> bool:
+        return self.page_type in (PT_LEAF_TABLE, PT_LEAF_INDEX)
+    
+    def is_table(self) -> bool:
+        return self.page_type in (PT_LEAF_TABLE, PT_INTERIOR_TABLE)
+```
+
+**B-Tree Cursor:**
+
+```python
+class BTreeCursor:
+    """
+    A cursor for navigating a B-Tree.
+    
+    Position tracking:
+    - Each level of the tree is tracked with a (page_number, cell_index) pair
+    - stack: list of (page_number, cell_index) from root to current depth
+    """
+    
+    def __init__(self, btree: 'BTree', root_page: int):
+        self.btree = btree
+        self.root_page = root_page
+        self.stack: list[tuple[int, int]] = []  # (page_number, cell_index) per level
+        self.eof = False
+        self.bof = True  # before first record
+    
+    def first(self):
+        """Position cursor at the first (leftmost) entry."""
+        page_num = self.root_page
+        page = BTreePage(self.btree.pager, page_num)
+        
+        while page.page_type in (PT_INTERIOR_TABLE, PT_INTERIOR_INDEX):
+            # Follow leftmost child
+            first_cell = page.read_cell(0)
+            if page.page_type == PT_INTERIOR_TABLE:
+                cell = TableInteriorCell.parse(first_cell)
+                self.stack.append((page_num, 0))
+                page_num = cell.left_child_page
+            else:
+                cell = IndexInteriorCell.parse(first_cell)
+                self.stack.append((page_num, 0))
+                page_num = cell.left_child_page
+            page = BTreePage(self.btree.pager, page_num)
+        
+        # Now on a leaf page: position at cell 0
+        if page.cell_count == 0:
+            self.eof = True
+            return
+        self.stack.append((page.page_number, 0))
+        self.eof = False
+        self.bof = False
+    
+    def last(self):
+        """Position cursor at the last (rightmost) entry."""
+        page_num = self.root_page
+        page = BTreePage(self.btree.pager, page_num)
+        
+        while page.page_type in (PT_INTERIOR_TABLE, PT_INTERIOR_INDEX):
+            last_idx = page.cell_count - 1
+            if last_idx >= 0:
+                last_cell = page.read_cell(last_idx)
+                if page.page_type == PT_INTERIOR_TABLE:
+                    cell = TableInteriorCell.parse(last_cell)
+                    self.stack.append((page_num, last_idx + 1))  # +1 for right_child
+                    page_num = cell.left_child_page  # ??? 
+                else:
+                    # Interior cell: follow rightmost child
+                    pass  # need to handle right_child
+            else:
+                # No cells: follow right_child directly
+                self.stack.append((page_num, 0))
+                page_num = page.right_child
+            page = BTreePage(self.btree.pager, page_num)
+        
+        # On leaf: last cell
+        if page.cell_count == 0:
+            self.eof = True
+            return
+        self.stack.append((page.page_number, page.cell_count - 1))
+        self.eof = False
+        self.bof = False
+    
+    def next(self):
+        """Advance cursor to next entry in key order."""
+        if self.eof:
+            return
+        
+        # Pop leaf position
+        page_num, cell_idx = self.stack.pop()
+        
+        # Try next cell on this page
+        page = BTreePage(self.btree.pager, page_num)
+        if cell_idx + 1 < page.cell_count:
+            self.stack.append((page_num, cell_idx + 1))
+            return
+        
+        # Walk up the stack until we find an interior page with more cells
+        while self.stack:
+            parent_num, parent_idx = self.stack.pop()
+            parent = BTreePage(self.btree.pager, parent_num)
+            
+            if parent_idx < parent.cell_count:
+                # Move to next cell in parent, then descend to its leftmost child
+                self.stack.append((parent_num, parent_idx))
+                
+                # Read the cell to get left_child
+                cell_data = parent.read_cell(parent_idx)
+                if parent.page_type == PT_INTERIOR_TABLE:
+                    cell = TableInteriorCell.parse(cell_data)
+                    next_page = cell.left_child_page
+                else:
+                    cell = IndexInteriorCell.parse(cell_data)
+                    next_page = cell.left_child_page
+                
+                # Descend to leftmost leaf of that subtree
+                while True:
+                    next_pg = BTreePage(self.btree.pager, next_page)
+                    if next_pg.is_leaf():
+                        self.stack.append((next_page, 0))
+                        return
+                    else:
+                        cell_data = next_pg.read_cell(0)
+                        if next_pg.page_type == PT_INTERIOR_TABLE:
+                            cell = TableInteriorCell.parse(cell_data)
+                            self.stack.append((next_page, 0))
+                            next_page = cell.left_child_page
+                        else:
+                            cell = IndexInteriorCell.parse(cell_data)
+                            self.stack.append((next_page, 0))
+                            next_page = cell.left_child_page
+            else:
+                # This was the last cell on parent; continue going up
+                continue
+        
+        self.eof = True
+    
+    def prev(self):
+        """Move cursor to previous entry in key order."""
+        if self.bof:
+            return
+        
+        page_num, cell_idx = self.stack.pop()
+        page = BTreePage(self.btree.pager, page_num)
+        
+        if cell_idx > 0:
+            self.stack.append((page_num, cell_idx - 1))
+            # Descend to rightmost leaf of the left subtree
+            # ...
+        else:
+            # Walk up
+            while self.stack:
+                parent_num, parent_idx = self.stack.pop()
+                if parent_idx > 0:
+                    self.stack.append((parent_num, parent_idx - 1))
+                    # Descend to rightmost leaf
+                    return
+            self.bof = True
+    
+    def seek(self, key: int) -> bool:
+        """
+        Position cursor on the first entry >= key.
+        Returns True if exact match found.
+        """
+        self.stack = []
+        page_num = self.root_page
+        exact_match = False
+        
+        while True:
+            page = BTreePage(self.btree.pager, page_num)
+            
+            if page.is_leaf():
+                # Binary search on leaf
+                lo, hi = 0, page.cell_count - 1
+                found_idx = -1
+                while lo <= hi:
+                    mid = (lo + hi) // 2
+                    cell_data = page.read_cell(mid)
+                    if page.page_type == PT_LEAF_TABLE:
+                        cell = TableLeafCell.parse(cell_data)
+                        cell_key = cell.rowid
+                    else:
+                        # Index leaf: extract key from record
+                        rec, _ = Record.decode(cell_data)
+                        cell_key = rec.get_values()[0]  # first column is key
+                    
+                    if cell_key < key:
+                        lo = mid + 1
+                    elif cell_key > key:
+                        hi = mid - 1
+                    else:
+                        found_idx = mid
+                        exact_match = True
+                        break
+                
+                if found_idx == -1:
+                    found_idx = lo  # position at insertion point
+                
+                if found_idx >= page.cell_count:
+                    self.eof = True
+                else:
+                    self.stack.append((page_num, found_idx))
+                    self.eof = False
+                return exact_match
+            
+            else:  # Interior page
+                # Binary search on interior page to find child
+                lo, hi = 0, page.cell_count - 1
+                child = page.right_child  # default: go right
+                mid = -1
+                
+                while lo <= hi:
+                    mid = (lo + hi) // 2
+                    cell_data = page.read_cell(mid)
+                    if page.page_type == PT_INTERIOR_TABLE:
+                        cell = TableInteriorCell.parse(cell_data)
+                        cell_key = cell.key
+                    else:
+                        cell = IndexInteriorCell.parse(cell_data)
+                        rec, _ = Record.decode(cell.payload)
+                        cell_key = rec.get_values()[0]
+                    
+                    if cell_key < key:
+                        lo = mid + 1
+                        child = cell.left_child_page  # Actually, need right child of this cell
+                    elif cell_key > key:
+                        hi = mid - 1
+                        child = cell.left_child_page if mid == 0 else ...
+                    else:
+                        # Exact match on interior page: descend to this cell's subtree
+                        child = cell.left_child_page
+                        self.stack.append((page_num, mid))
+                        page_num = child
+                        exact_match = True
+                        break
+                
+                if mid == -1 or lo > hi:
+                    # Descend to appropriate child
+                    self.stack.append((page_num, lo if lo < page.cell_count else page.right_child))
+                    page_num = child
+        
+        return exact_match
+    
+    def current_key(self) -> int:
+        """Return the key (rowid for table, first column for index) at current position."""
+        page_num, cell_idx = self.stack[-1]
+        page = BTreePage(self.btree.pager, page_num)
+        cell_data = page.read_cell(cell_idx)
+        
+        if page.page_type == PT_LEAF_TABLE:
+            cell = TableLeafCell.parse(cell_data)
+            return cell.rowid
+        elif page.page_type == PT_LEAF_INDEX:
+            cell = IndexLeafCell.parse(cell_data)
+            rec, _ = Record.decode(cell.payload)
+            return rec.get_values()[0]
+        elif page.page_type == PT_INTERIOR_TABLE:
+            cell = TableInteriorCell.parse(cell_data)
+            return cell.key
+        else:
+            cell = IndexInteriorCell.parse(cell_data)
+            rec, _ = Record.decode(cell.payload)
+            return rec.get_values()[0]
+    
+    def current_payload(self) -> bytes:
+        """Return the payload at current position (table leaf only)."""
+        page_num, cell_idx = self.stack[-1]
+        page = BTreePage(self.btree.pager, page_num)
+        cell_data = page.read_cell(cell_idx)
+        
+        if page.page_type == PT_LEAF_TABLE:
+            cell = TableLeafCell.parse(cell_data)
+            return cell.payload
+        raise TypeError("Not a leaf table cursor")
+    
+    def insert(self, key: int, rowid: int, payload: bytes):
+        """Insert a new entry."""
+        # Navigate to the leaf page where the key should be inserted
+        page_num = self.root_page
+        page = BTreePage(self.btree.pager, page_num)
+        
+        # Find path to leaf
+        path = []
+        while not page.is_leaf():
+            # Binary search to find which child to follow
+            cell_data = None
+            for i in range(page.cell_count):
+                data = page.read_cell(i)
+                if page.page_type == PT_INTERIOR_TABLE:
+                    cell = TableInteriorCell.parse(data)
+                    if key < cell.key:
+                        path.append((page_num, i))
+                        page_num = cell.left_child_page
+                        break
+                    elif i == page.cell_count - 1:
+                        path.append((page_num, page.right_child))
+                        page_num = page.right_child
+                        break
+                else:
+                    # Index interior
+                    pass
+            page = BTreePage(self.btree.pager, page_num)
+        
+        # Now on leaf page
+        cell_data = None
+        if page.page_type == PT_LEAF_TABLE:
+            cell_data = TableLeafCell(rowid, payload).serialize()
+        else:
+            cell_data = IndexLeafCell(payload).serialize()
+        
+        # Find insertion position
+        insert_idx = 0
+        for i in range(page.cell_count):
+            cdata = page.read_cell(i)
+            if page.page_type == PT_LEAF_TABLE:
+                ccell = TableLeafCell.parse(cdata)
+                ck = ccell.rowid
+            else:
+                ccell = IndexLeafCell.parse(cdata)
+                rec, _ = Record.decode(ccell.payload)
+                ck = rec.get_values()[0]
+            if ck < key:
+                insert_idx = i + 1
+        
+        page.insert_cell(insert_idx, cell_data)
+        
+        # Check if page needs splitting
+        if page.cell_content_offset <= self._pointer_offset(page.cell_count) + 4:
+            self._balance(path, page, insert_idx)
+    
+    def _balance(self, path: list, page: BTreePage, insert_idx: int):
+        """
+        Balance the tree after an insertion.
+        Splits the page if full, possibly cascading splits upward.
+        """
+        # Implementation: split page into two, promote middle key to parent
+        # If no parent, create new root
+        ...
+    
+    def delete(self):
+        """Delete the entry at current cursor position."""
+        page_num, cell_idx = self.stack[-1]
+        page = BTreePage(self.btree.pager, page_num)
+        page.delete_cell(cell_idx)
+        
+        # Check if page needs rebalancing (too empty)
+        if page.cell_count == 0 and page.page_number != self.root_page:
+            self._rebalance_after_delete()
+    
+    def _rebalance_after_delete(self):
+        """Rebalance after deletion: borrow from sibling or merge."""
+        ...
+
+
+class BTree:
+    """
+    Manages a B-Tree structure. Provides factory methods for cursors
+    and handles tree-level operations (page splits, merges).
+    """
+    
+    def __init__(self, pager: 'Pager', root_page: int, is_table: bool):
+        self.pager = pager
+        self.root_page = root_page
+        self.is_table = is_table
+    
+    def cursor(self) -> BTreeCursor:
+        return BTreeCursor(self, self.root_page)
+    
+    def create_leaf_page(self) -> int:
+        """Create a new empty leaf page and return its page number."""
+        page_num = self.pager.allocate_page()
+        page = BTreePage(self.pager, page_num)
+        page.page_type = PT_LEAF_TABLE if self.is_table else PT_LEAF_INDEX
+        page.cell_count = 0
+        page.first_freeblock = 0
+        page.cell_content_offset = self.pager.page_size
+        page.fragmented_free_bytes = 0
+        page.right_child = 0
+        page.flush()
+        return page_num
+    
+    def create_interior_page(self, right_child: int) -> int:
+        """Create a new interior page."""
+        page_num = self.pager.allocate_page()
+        page = BTreePage(self.pager, page_num)
+        page.page_type = PT_INTERIOR_TABLE if self.is_table else PT_INTERIOR_INDEX
+        page.cell_count = 0
+        page.first_freeblock = 0
+        page.cell_content_offset = self.pager.page_size
+        page.fragmented_free_bytes = 0
+        page.right_child = right_child
+        page.flush()
+        return page_num
+    
+    def split_leaf_page(self, page: BTreePage) -> tuple[int, int, bytes]:
+        """
+        Split a full leaf page into two.
+        Returns (new_page_number, middle_key, middle_payload).
+        The middle entry gets promoted to the parent.
+        """
+        # Collect all cells with their keys
+        entries = []
+        for i in range(page.cell_count):
+            cell_data = page.read_cell(i)
+            if page.page_type == PT_LEAF_TABLE:
+                cell = TableLeafCell.parse(cell_data)
+                entries.append((cell.rowid, cell_data))
+            else:
+                cell = IndexLeafCell.parse(cell_data)
+                rec, _ = Record.decode(cell.payload)
+                key = rec.get_values()[0]
+                entries.append((key, cell_data))
+        
+        # Sort by key (should already be sorted)
+        entries.sort(key=lambda x: x[0])
+        
+        # Find middle
+        mid = len(entries) // 2
+        middle_key = entries[mid][0]
+        middle_payload = entries[mid][1]
+        
+        # Create new page
+        new_page_num = self.create_leaf_page()
+        new_page = BTreePage(self.pager, new_page_num)
+        
+        # Redistribute cells: right half goes to new page
+        page.cell_count = 0
+        page._write_header()
+        page.dirty = True
+        
+        for i, (key, data) in enumerate(entries):
+            if i < mid:
+                page.insert_cell(page.cell_count, data)
+            else:
+                new_page.insert_cell(new_page.cell_count, data)
+        
+        page.flush()
+        new_page.flush()
+        
+        return (new_page_num, middle_key, middle_payload)
+    
+    def split_interior_page(self, page: BTreePage) -> tuple[int, int, bytes]:
+        """Split an interior page. Returns (new_page, middle_key, middle_payload)."""
+        # Similar to leaf split, but handles child pointers
+        ...
+```
+
+

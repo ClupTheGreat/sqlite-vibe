@@ -8,34 +8,34 @@
 ## Phase 0: Infrastructure & Utilities
 
 ```
-[ ] 0.1 Bit-level utilities (varint, twos complement)
-[ ] 0.2 Error hierarchy
-[ ] 0.3 Format constants
+[x] 0.1 Bit-level utilities (varint, twos complement)
+[x] 0.2 Error hierarchy
+[x] 0.3 Format constants
 ```
 
 ## Phase 1: Storage Layer (VFS + Pager)
 
 ```
-[ ] 1.1 VFS interface (OSVFS, MemoryVFS)
-[ ] 1.2 Pager (page cache, read/write, flush, sync)
-[ ] 1.3 Database header (init, parse)
-[ ] 1.4 Rollback journal (begin, commit, rollback)
-[ ] 1.5 Hot journal recovery
-[ ] 1.6 Freelist management (allocate, free, pop, push)
-[ ] 1.7 Cache eviction (LRU)
+[x] 1.1 VFS interface (OSVFS, MemoryVFS)
+[x] 1.2 Pager (page cache, read/write, flush, sync)
+[x] 1.3 Database header (init, parse)
+[x] 1.4 Rollback journal (begin, commit, rollback)
+[x] 1.5 Hot journal recovery
+[x] 1.6 Freelist management (allocate, free, pop, push)
+[x] 1.7 Cache eviction (LRU)
 [ ] 1.8 WAL mode
 ```
 
 ## Phase 2: Record & B-Tree Engine
 
 ```
-[ ] 2.1 Cell serialization (4 cell types)
-[ ] 2.2 Record encoding (serial types, encode/decode)
-[ ] 2.3 B-Tree page (header, pointers, freeblocks, defrag)
-[ ] 2.4 B-Tree cursor (first, last, next, prev, seek)
-[ ] 2.5 B-Tree insert (cell insertion, page splitting)
-[ ] 2.6 B-Tree delete (cell removal, rebalancing)
-[ ] 2.7 Overflow page handling
+[x] 2.1 Cell serialization (4 cell types)
+[x] 2.2 Record encoding (serial types, encode/decode)
+[x] 2.3 B-Tree page (header, pointers, freeblocks, defrag)
+[x] 2.4 B-Tree cursor (first, last, next, prev, seek)
+[x] 2.5 B-Tree insert (cell insertion, page splitting)
+[x] 2.6 B-Tree delete (cell removal, rebalancing)
+[x] 2.7 Overflow page handling
 ```
 
 ## Phase 3: SQL Language
