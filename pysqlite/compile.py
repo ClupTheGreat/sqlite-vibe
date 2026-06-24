@@ -267,20 +267,31 @@ class Compiler:
             self._compile_binary_op(expr, reg, cursor)
 
         elif isinstance(expr, FunctionCall):
+            func = expr.name.upper()
             arg_regs = [self.compile_expr(a, cursor) for a in expr.args]
             first_reg = arg_regs[0] if arg_regs else 0
             n_args = len(arg_regs)
-            if expr.name.upper() == 'LIKE':
+            if func == 'LIKE':
                 self.emit(Opcode.Like, P1=first_reg, P3=reg,
                           P4=n_args, comment='LIKE')
-            elif expr.name.upper() == 'GLOB':
+            elif func == 'GLOB':
                 self.emit(Opcode.Glob, P1=first_reg, P3=reg,
                           P4=n_args, comment='GLOB')
-            elif expr.star:
+            elif func == 'COUNT' and expr.star:
                 self.emit(Opcode.Count, P1=reg, comment='COUNT(*)')
+            elif func in AGGREGATE_FUNCTIONS:
+                self.emit(Opcode.Aggregate, P1=reg, P4={'name': func, 'star': expr.star, 'args': arg_regs},
+                          comment=f'aggregate {func}')
+            elif func in ('ABS', 'UPPER', 'LOWER', 'LENGTH', 'SUBSTR'):
+                self.emit(Opcode.Function, P1=first_reg, P2=n_args, P3=reg,
+                          P4=func, comment=f'func {func}')
+            elif func in ('SIN', 'COS', 'TAN', 'ASIN', 'ACOS', 'ATAN', 'CEIL', 'FLOOR', 
+                         'ROUND', 'LOG', 'LOG10', 'SQRT', 'EXP', 'PI', 'POWER', 'POW', 'RAND'):
+                self.emit(Opcode.Function, P1=first_reg, P2=n_args, P3=reg,
+                          P4=func, comment=f'func {func}')
             else:
                 self.emit(Opcode.Function, P1=first_reg, P2=n_args, P3=reg,
-                          P4=expr.name, comment=f'func {expr.name}')
+                          P4=func, comment=f'func {func}')
 
         elif isinstance(expr, CaseExpr):
             end_label = self._label_name('case_end')

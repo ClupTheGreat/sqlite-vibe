@@ -235,6 +235,69 @@ class TestAggregates:
         assert res == [[2]]
 
 
+class TestMathFunctions:
+    def test_abs(self, db):
+        res = db.execute('SELECT ABS(-5)')
+        assert res == [[5]]
+
+    def test_sin(self, db):
+        res = db.execute('SELECT SIN(0)')
+        import math
+        assert abs(res[0][0] - 0.0) < 0.001
+
+    def test_cos(self, db):
+        res = db.execute('SELECT COS(0)')
+        assert abs(res[0][0] - 1.0) < 0.001
+
+    def test_ceil(self, db):
+        res = db.execute('SELECT CEIL(1.5)')
+        assert res == [[2]]
+
+    def test_floor(self, db):
+        res = db.execute('SELECT FLOOR(1.5)')
+        assert res == [[1]]
+
+    def test_round(self, db):
+        res = db.execute('SELECT ROUND(1.5)')
+        assert res == [[2]]
+
+    def test_log(self, db):
+        res = db.execute('SELECT LOG(10)')
+        import math
+        assert abs(res[0][0] - 2.302585) < 0.001
+
+    def test_log10(self, db):
+        res = db.execute('SELECT LOG10(100)')
+        assert abs(res[0][0] - 2.0) < 0.001
+
+    def test_sqrt(self, db):
+        res = db.execute('SELECT SQRT(16)')
+        assert abs(res[0][0] - 4.0) < 0.001
+
+    def test_exp(self, db):
+        res = db.execute('SELECT EXP(1)')
+        import math
+        assert abs(res[0][0] - math.e) < 0.001
+
+    def test_sin_negative(self, db):
+        res = db.execute('SELECT SIN(-1)')
+        import math
+        assert abs(res[0][0] - math.sin(-1)) < 0.001
+
+    def test_cos_negative(self, db):
+        res = db.execute('SELECT COS(-1)')
+        import math
+        assert abs(res[0][0] - math.cos(-1)) < 0.001
+
+    def test_sqrt_zero(self, db):
+        res = db.execute('SELECT SQRT(0)')
+        assert abs(res[0][0]) < 0.001
+
+    def test_exp_zero(self, db):
+        res = db.execute('SELECT EXP(0)')
+        assert abs(res[0][0] - 1.0) < 0.001
+
+
 class TestTransactions:
     def test_begin_commit(self, db):
         db.execute('CREATE TABLE t (a INT)')
