@@ -123,6 +123,64 @@ When you encounter a problem during development, add an entry like:
     data. Subsequent first() from a fresh BTreePage read the old data.
     Fixed by adding page.flush() after delete_cell.
 
+[2026-06-24] Lexer _read_operator matched 2-char ops before 3-char (-> before ->>)
+  - File: pysqlite/lexer.py:362-374 (fixed)
+  - Severity: high
+  - Details: _read_operator checked 2-character operators first. For "->>", it
+    matched "->" (ARROW) and left ">" as a separate GT token. Fixed to check
+    3-character operators ("->>") first before falling back to 2-char.
+
+[2026-06-24] Lexer _emit used self.col after advance (wrong start column)
+  - File: pysqlite/lexer.py:259-263 (fixed)
+  - Severity: medium
+  - Details: _emit defaulted to self.col which had already advanced past the
+    token. Fixed by storing start line/col per-token and using those in _emit.
+
+[2026-06-24] Parser CREATE TABLE/VIEW didn't consume TABLE/VIEW keyword before name
+  - File: pysqlite/parser.py:154, 400 (fixed)
+  - Severity: high
+  - Details: _parse_create_table and _parse_create_view didn't advance past
+    TABLE/VIEW before calling _parse_table_name(), causing "Expected IDENTIFIER,
+    got TABLE/VIEW" errors. Added self.advance() before IF NOT EXISTS check.
+
+[2026-06-24] Parser CREATE didn't handle UNIQUE before INDEX
+  - File: pysqlite/parser.py:144 (fixed)
+  - Severity: high
+  - Details: _parse_create checked tt == INDEX but not tt == UNIQUE, so
+    "CREATE UNIQUE INDEX" failed. Added UNIQUE to the dispatch condition.
+
+[2026-06-24] Parser DROP consumed IF EXISTS before dispatching to sub-methods
+  - File: pysqlite/parser.py:468-515 (fixed)
+  - Severity: high
+  - Details: _parse_drop set tt before consuming IF EXISTS, then dispatched
+    by tt. Sub-methods then saw IF as the next token instead of the name.
+    Fixed by moving IF EXISTS consumption into each sub-method.
+
+[2026-06-24] Parser ROLLBACK dispatch checked wrong token type
+  - File: pysqlite/parser.py:58 (fixed)
+  - Severity: medium
+  - Details: _parse_statement checked TokenType.ROLLBACK_STMT but the lexer
+    emits TokenType.ROLLBACK. Changed to TokenType.ROLLBACK.
+
+[2026-06-24] Parser NOT NULL used non-existent TokenType.NOTNULL
+  - File: pysqlite/parser.py:1008-1019 (fixed)
+  - Severity: high
+  - Details: Parser checked TokenType.NOTNULL which didn't exist in the enum.
+    Fixed by advancing on NOT then checking for NULL with two-token lookahead.
+
+[2026-06-24] Parser join table_ref wrapped JoinClause in tuple
+  - File: pysqlite/parser.py:652-653 (fixed)
+  - Severity: high
+  - Details: _parse_table_ref returned (JoinClause(...),) instead of
+    JoinClause(...), causing isinstance checks in tests to fail. Fixed by
+    returning jc directly.
+
+[2026-06-24] TokenType enum missing several keywords used by parser
+  - File: pysqlite/lexer.py:8-57 (fixed)
+  - Severity: high
+  - Details: TokenType was missing NULLS, ADD, COLUMN, TRANSACTION, RENAME,
+    BEFORE, AFTER, INSTEAD, FIRST, LAST. All added with keyword mappings.
+
 [2026-06-24] _rebalance_after_delete left root as interior with 0 cells
   - File: pysqlite/btree.py:744-795 (fixed)
   - Severity: medium

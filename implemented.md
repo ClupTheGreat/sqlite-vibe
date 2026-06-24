@@ -41,16 +41,16 @@
 ## Phase 3: SQL Language
 
 ```
-[ ] 3.1 Lexer (all token types, comments, strings)
-[ ] 3.2 Parser — DDL (CREATE TABLE/INDEX/VIEW/TRIGGER)
-[ ] 3.3 Parser — DML (SELECT, INSERT, UPDATE, DELETE)
-[ ] 3.4 Parser — Expressions (full precedence, CASE, CAST, subqueries)
-[ ] 3.5 Parser — Joins (all types, ON, USING)
-[ ] 3.6 Parser — Window definitions
-[ ] 3.7 Parser — CTEs (WITH, RECURSIVE)
-[ ] 3.8 Parser — UPSERT, RETURNING
-[ ] 3.9 Parser — Transaction statements
-[ ] 3.10 AST node classes
+[x] 3.1 Lexer (all token types, comments, strings)
+[x] 3.2 Parser — DDL (CREATE TABLE/INDEX/VIEW/TRIGGER)
+[x] 3.3 Parser — DML (SELECT, INSERT, UPDATE, DELETE)
+[x] 3.4 Parser — Expressions (full precedence, CASE, CAST, subqueries)
+[x] 3.5 Parser — Joins (all types, ON, USING)
+[x] 3.6 Parser — Window definitions
+[x] 3.7 Parser — CTEs (WITH, RECURSIVE)
+[x] 3.8 Parser — UPSERT, RETURNING
+[x] 3.9 Parser — Transaction statements
+[x] 3.10 AST node classes
 ```
 
 ## Phase 4: Bytecode Compiler & Virtual Machine
