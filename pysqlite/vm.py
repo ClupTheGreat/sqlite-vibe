@@ -828,9 +828,146 @@ class VM:
             return math.pow(float(args[0]), float(args[1])) if len(args) >= 2 else None
         if name_upper == 'RAND':
             return random.random() * 2 - 1
+        if name_upper in ('DATE', 'TIME', 'DATETIME', 'JULIANDAY', 'STRFTIME', 'UNIXEPOCH'):
+            return self._call_datetime(name_upper, args)
         if not args:
             return None
         return args[0]
+
+    def _parse_timestring(self, s: str) -> 'datetime.datetime':
+        from datetime import datetime, timezone, timedelta
+        s = s.strip()
+        if s.lower() == 'now':
+            return datetime.now(timezone.utc).replace(tzinfo=None)
+        try:
+            jd = float(s)
+            return datetime(1, 1, 1) + timedelta(days=jd - 1721425.5)
+        except ValueError:
+            pass
+        for fmt in ('%Y-%m-%d', '%H:%M:%S', '%Y-%m-%d %H:%M:%S', '%Y-%m-%dT%H:%M:%S',
+                     '%Y-%m-%dT%H:%M:%S.%f', '%Y-%m-%d %H:%M:%S.%f'):
+            try:
+                return datetime.strptime(s, fmt)
+            except ValueError:
+                continue
+        raise ValueError(f"not a valid timestring: {s}")
+
+    def _apply_modifiers(self, dt: 'datetime.datetime', modifiers: list) -> 'datetime.datetime':
+        from datetime import datetime, timedelta
+        import calendar
+        for mod in modifiers:
+            m = mod.strip()
+            if m == 'start of month':
+                dt = dt.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+            elif m == 'start of year':
+                dt = dt.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
+            elif m == 'start of day':
+                dt = dt.replace(hour=0, minute=0, second=0, microsecond=0)
+            elif m.startswith('weekday '):
+                target = int(m[8:])
+                current = dt.weekday()
+                # weekday 0 = Monday in Python, 0 = Sunday in SQLite
+                current_sqlite = (current + 1) % 7
+                diff = (target - current_sqlite) % 7
+                dt += timedelta(days=diff)
+            elif m.startswith('+') or m.startswith('-') or m[0].isdigit():
+                parts = m.split()
+                if len(parts) >= 2:
+                    try:
+                        n = int(parts[0])
+                    except ValueError:
+                        continue
+                    unit = parts[1].lower()
+                    if unit.startswith('year'):
+                        month = dt.month + n * 12
+                        year = dt.year + (month - 1) // 12
+                        month = ((month - 1) % 12) + 1
+                        try:
+                            max_day = calendar.monthrange(year, month)[1]
+                        except ValueError:
+                            max_day = 28  # fallback for very early dates
+                        dt = dt.replace(year=year, month=month, day=min(dt.day, max_day))
+                    elif unit.startswith('month'):
+                        month = dt.month + n
+                        year = dt.year + (month - 1) // 12
+                        month = ((month - 1) % 12) + 1
+                        try:
+                            max_day = calendar.monthrange(year, month)[1]
+                        except ValueError:
+                            max_day = 28
+                        dt = dt.replace(year=year, month=month, day=min(dt.day, max_day))
+                    elif unit.startswith('day'):
+                        dt += timedelta(days=n)
+                    elif unit.startswith('hour'):
+                        dt += timedelta(hours=n)
+                    elif unit.startswith('minute'):
+                        dt += timedelta(minutes=n)
+                    elif unit.startswith('second'):
+                        dt += timedelta(seconds=n)
+            elif m == 'localtime':
+                import time
+                ts = dt.timestamp()
+                lt = time.localtime(ts)
+                dt = datetime(lt.tm_year, lt.tm_mon, lt.tm_mday,
+                              lt.tm_hour, lt.tm_min, lt.tm_sec)
+            elif m == 'utc':
+                import time
+                ts = dt.timestamp()
+                ut = time.gmtime(ts)
+                dt = datetime(ut.tm_year, ut.tm_mon, ut.tm_mday,
+                              ut.tm_hour, ut.tm_min, ut.tm_sec)
+        return dt
+
+    def _unixepoch_to_dt(self, ts: float) -> 'datetime.datetime':
+        from datetime import datetime, timedelta
+        return datetime(1970, 1, 1) + timedelta(seconds=ts)
+
+    def _call_datetime(self, func: str, args: list) -> Any:
+        from datetime import datetime, timezone, timedelta
+        if func == 'STRFTIME':
+            fmt = str(args[0]) if args else ''
+            ts = args[1] if len(args) > 1 else 'now'
+            mods = [str(a) for a in args[2:]] if len(args) > 2 else []
+            if ts is None:
+                return None
+            if isinstance(ts, (int, float)):
+                dt = self._unixepoch_to_dt(float(ts))
+            else:
+                dt = self._parse_timestring(str(ts))
+            dt = self._apply_modifiers(dt, mods)
+            return dt.strftime(fmt)
+        if not args:
+            now = datetime.now(timezone.utc).replace(tzinfo=None)
+            dt = now
+        else:
+            ts = args[0]
+            modifiers = [str(a) for a in args[1:]] if len(args) > 1 else []
+            if ts is None:
+                return None
+            if isinstance(ts, (int, float)):
+                if 'unixepoch' in [str(m).lower() for m in args[1:]]:
+                    dt = self._unixepoch_to_dt(float(ts))
+                    modifiers_clean = []
+                    for m in args[1:]:
+                        if str(m).lower() != 'unixepoch':
+                            modifiers_clean.append(str(m))
+                    modifiers = modifiers_clean
+                else:
+                    dt = self._parse_timestring(str(ts))
+            else:
+                dt = self._parse_timestring(str(ts))
+            dt = self._apply_modifiers(dt, modifiers)
+        if func == 'DATE':
+            return dt.strftime('%Y-%m-%d')
+        if func == 'TIME':
+            return dt.strftime('%H:%M:%S')
+        if func == 'DATETIME':
+            return dt.strftime('%Y-%m-%d %H:%M:%S')
+        if func == 'JULIANDAY':
+            return (dt - datetime(1, 1, 1)).days + 1721425.0 + (dt - datetime(1, 1, 1)).seconds / 86400.0
+        if func == 'UNIXEPOCH':
+            return int((dt - datetime(1970, 1, 1)).total_seconds())
+        return None
 
     # ── EXPLAIN ──
 

@@ -298,6 +298,71 @@ class TestMathFunctions:
         assert abs(res[0][0] - 1.0) < 0.001
 
 
+class TestDateTimeFunctions:
+    def test_date_now(self, db):
+        from datetime import datetime, timezone
+        res = db.execute("SELECT DATE('now')")
+        expected = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+        assert res[0][0] == expected
+
+    def test_time_now(self, db):
+        res = db.execute("SELECT TIME('now')")
+        assert ':' in res[0][0]
+
+    def test_datetime_now(self, db):
+        from datetime import datetime, timezone
+        res = db.execute("SELECT DATETIME('now')")
+        assert ' ' in res[0][0]
+
+    def test_julianday(self, db):
+        res = db.execute("SELECT JULIANDAY('2024-01-01')")
+        assert abs(res[0][0] - 2460310.0) < 0.001
+
+    def test_date_format(self, db):
+        res = db.execute("SELECT DATE('2024-03-15')")
+        assert res[0][0] == '2024-03-15'
+
+    def test_date_add_days(self, db):
+        res = db.execute("SELECT DATE('2024-01-01', '+1 day')")
+        assert res[0][0] == '2024-01-02'
+
+    def test_date_add_months(self, db):
+        res = db.execute("SELECT DATE('2024-01-01', '+1 month')")
+        assert res[0][0] == '2024-02-01'
+
+    def test_date_start_of_month(self, db):
+        res = db.execute("SELECT DATE('2024-03-15', 'start of month')")
+        assert res[0][0] == '2024-03-01'
+
+    def test_date_start_of_year(self, db):
+        res = db.execute("SELECT DATE('2024-03-15', 'start of year')")
+        assert res[0][0] == '2024-01-01'
+
+    def test_strftime(self, db):
+        res = db.execute("SELECT STRFTIME('%Y-%m-%d', '2024-06-15')")
+        assert res[0][0] == '2024-06-15'
+
+    def test_strftime_format(self, db):
+        res = db.execute("SELECT STRFTIME('%d/%m/%Y', '2024-03-15')")
+        assert res[0][0] == '15/03/2024'
+
+    def test_date_localtime(self, db):
+        res = db.execute("SELECT DATE('now', 'localtime')")
+        assert '-' in res[0][0]
+
+    def test_unixepoch(self, db):
+        res = db.execute("SELECT UNIXEPOCH('2024-01-01')")
+        assert res[0][0] == 1704067200
+
+    def test_date_sub_days(self, db):
+        res = db.execute("SELECT DATE('2024-01-10', '-5 days')")
+        assert res[0][0] == '2024-01-05'
+
+    def test_datetime_iso(self, db):
+        res = db.execute("SELECT DATETIME('2024-01-01T12:30:00')")
+        assert res[0][0] == '2024-01-01 12:30:00'
+
+
 class TestTransactions:
     def test_begin_commit(self, db):
         db.execute('CREATE TABLE t (a INT)')
