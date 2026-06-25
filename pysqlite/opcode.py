@@ -67,6 +67,8 @@ class Opcode:
     Ge = 'Ge'
     IsNull = 'IsNull'
     NotNull = 'NotNull'
+    Not = 'Not'
+    Distinct = 'Distinct'
     Compare = 'Compare'
     If = 'If'
     IfNot = 'IfNot'

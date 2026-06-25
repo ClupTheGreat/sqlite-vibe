@@ -332,6 +332,49 @@ When you encounter a problem during development, add an entry like:
     registers between column results. ResultRow assumed registers were
     contiguous starting from min(col_regs). Fixed by adding MemCopy compaction
     to make column registers contiguous before ResultRow.
+
+[2026-06-25] INSERT OR REPLACE does not replace — inserts duplicate
+  - File: pysqlite/compile.py:534-560
+  - Severity: medium
+  - Details: INSERT OR REPLACE is compiled as a plain INSERT without checking
+    for existing PK before insert. The compiled code only opens the table and
+    inserts the row, never seeking for an existing record. If a row with the
+    same PK exists, a duplicate is created. To fix, need to add SeekRowid +
+    Delete logic before Insert in the INSERT OR REPLACE code path.
+
+[2026-06-25] NOT NULL column constraint not enforced on INSERT
+  - File: pysqlite/compile.py
+  - Severity: medium
+  - Details: INSERT statement never checks for NOT NULL constraints on columns.
+    The compiler emits only MakeRecord + Insert, without any Null+Eq comparison
+    or Halt for NOT NULL columns. To fix, need to add NOT NULL checks after
+    computing column values but before MakeRecord.
+
+[2026-06-25] Hex literal x'...' parsed as string, not BLOB
+  - File: pysqlite/lexer.py or pysqlite/parser.py
+  - Severity: low
+  - Details: The hex literal syntax x'0102' is tokenized as a string literal
+    rather than a BLOB. The lexer sees x'...' and tokenizes the whole thing
+    as a single string (including the x prefix). To fix, would need to detect
+    the x prefix in the lexer and produce a BLOB token type, then decode
+    hex in the parser.
+
+[2026-06-25] INSERT OR REPLACE with composite PK does not detect conflict
+  - File: pysqlite/compile.py
+  - Severity: medium
+  - Details: ON CONFLICT DO UPDATE with a composite PRIMARY KEY (a, b) does not
+    detect the conflict and produces a duplicate row instead of updating.
+    The SeekRowid instruction before the Insert only looks up by rowid, but
+    WITHOUT ROWID tables use the PK columns as the key. For WITHOUT ROWID
+    tables, need to open the index cursor and seek by the composite key.
+
+[2026-06-25] WITHOUT ROWID composite PK ORDER BY returns wrong order
+  - File: pysqlite/btree.py (likely)
+  - Severity: low
+  - Details: SELECT from WITHOUT ROWID table with composite PK and ORDER BY a, b
+    returns rows in wrong order (b before a). The issue is that the B-Tree
+    cursor first() returns rows in PK order but the composite PK ordering
+    may be using a single int key instead of comparing the full composite key.
 ```
 
 

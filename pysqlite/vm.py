@@ -74,6 +74,7 @@ class VM:
         'agg_accumulators', 'agg_instances', 'sub_return_stack',
         'explain_mode', '_current_row', '_affinity_cache',
         'sort_spec', 'agg_spec', 'custom_functions', 'custom_aggregates', 'params',
+        'distinct',
     )
 
     def __init__(self, pager, tx=None, custom_functions=None, custom_aggregates=None):
@@ -118,6 +119,7 @@ class VM:
         self._current_row = []
         self.sort_spec = []
         self.agg_spec = None
+        self.distinct = False
         self.params: dict = params or {}
 
         if self.pager is None:
@@ -138,6 +140,9 @@ class VM:
 
         if self.agg_spec:
             self._do_aggregation()
+
+        if self.distinct:
+            self._dedup_results()
 
         return self.result_rows
 
@@ -477,6 +482,9 @@ class VM:
     def _op_NotNull(self, P1: int, P2: int, P3: int, P4: Any, P5: int):
         if self._reg(P1).type != RegisterType.NULL and P2 > 0:
             self.pc = P2
+
+    def _op_Not(self, P1: int, P2: int, P3: int, P4: Any, P5: int):
+        self._set_reg(P2, Register(RegisterType.INT, 0 if self._truthy(P1) else 1))
 
     def _op_If(self, P1: int, P2: int, P3: int, P4: Any, P5: int):
         if self._truthy(P1) and P2 > 0:
@@ -872,91 +880,14 @@ class VM:
         name_upper = name.upper()
         if name_upper in self.custom_functions:
             return self.custom_functions[name_upper](*args)
-        if name_upper == 'ABS':
-            return abs(args[0]) if args else 0
-        if name_upper in ('COALESCE', 'IFNULL'):
-            for a in args:
-                if a is not None:
-                    return a
-            return None
-        if name_upper == 'NULLIF':
-            return None if len(args) >= 2 and args[0] == args[1] else args[0]
-        if name_upper == 'TYPEOF':
-            if not args:
-                return 'null'
-            v = args[0]
-            if v is None:
-                return 'null'
-            if isinstance(v, int) and not isinstance(v, bool):
-                return 'integer'
-            if isinstance(v, float):
-                return 'real'
-            if isinstance(v, str):
-                return 'text'
-            if isinstance(v, bytes):
-                return 'blob'
-            return 'null'
-        if name_upper == 'LENGTH':
-            s = str(args[0]) if args and args[0] is not None else ''
-            return len(s)
-        if name_upper == 'UPPER':
-            return str(args[0]).upper() if args and args[0] is not None else ''
-        if name_upper == 'LOWER':
-            return str(args[0]).lower() if args and args[0] is not None else ''
-        if name_upper == 'SUBSTR':
-            if len(args) < 2:
-                return ''
-            s = str(args[0] or '')
-            start = int(args[1] or 0)
-            length = int(args[2]) if len(args) >= 3 and args[2] is not None else len(s)
-            return s[start - 1:start - 1 + length] if start > 0 else s[:length]
-        if name_upper == 'IFNULL':
-            return args[0] if args[0] is not None else args[1] if len(args) > 1 else None
         if name_upper == 'LAST_INSERT_ROWID':
             return self.last_rowid
-        if name_upper == 'CHANGES':
+        if name_upper in ('CHANGES', 'TOTAL_CHANGES'):
             return self.changes
-        if name_upper == 'TOTAL_CHANGES':
-            return self.changes
-        if name_upper == 'RANDOM':
-            import random
-            return random.randint(-2**63, 2**63 - 1)
-        if name_upper == 'ZEROBLOB':
-            n = int(args[0]) if args and args[0] is not None else 0
-            return b'\x00' * n
-        import math
-        if name_upper == 'SIN':
-            return math.sin(float(args[0])) if args else None
-        if name_upper == 'COS':
-            return math.cos(float(args[0])) if args else None
-        if name_upper == 'TAN':
-            return math.tan(float(args[0])) if args else None
-        if name_upper == 'ASIN':
-            return math.asin(float(args[0])) if args else None
-        if name_upper == 'ACOS':
-            return math.acos(float(args[0])) if args else None
-        if name_upper == 'ATAN':
-            return math.atan(float(args[0])) if args else None
-        if name_upper == 'CEIL':
-            return math.ceil(float(args[0])) if args else None
-        if name_upper == 'FLOOR':
-            return math.floor(float(args[0])) if args else None
-        if name_upper == 'ROUND':
-            return round(float(args[0])) if args else None
-        if name_upper == 'LOG':
-            return math.log(float(args[0])) if args else None
-        if name_upper == 'LOG10':
-            return math.log10(float(args[0])) if args else None
-        if name_upper == 'SQRT':
-            return math.sqrt(float(args[0])) if args else None
-        if name_upper == 'EXP':
-            return math.exp(float(args[0])) if args else None
-        if name_upper == 'PI':
-            return math.pi
-        if name_upper in ('POWER', 'POW'):
-            return math.pow(float(args[0]), float(args[1])) if len(args) >= 2 else None
-        if name_upper == 'RAND':
-            return random.random() * 2 - 1
+        from pysqlite.functions.scalar import call_function as _call_scalar
+        result = _call_scalar(name, args, self.custom_functions)
+        if result is not NotImplemented:
+            return result
         if name_upper in ('DATE', 'TIME', 'DATETIME', 'JULIANDAY', 'STRFTIME', 'UNIXEPOCH'):
             return self._call_datetime(name_upper, args)
         json_result = self._call_json_function(name_upper, args)
@@ -1665,60 +1596,8 @@ class VM:
         return None
 
     def _compute_aggregate(self, name: str, values: list, star: bool = False):
-        name_upper = name.upper()
-        if name_upper in self.custom_aggregates:
-            agg_cls = self.custom_aggregates[name_upper]
-            instance = agg_cls()
-            for v in values:
-                instance.step(v) if hasattr(instance, 'step') else None
-            return instance.final() if hasattr(instance, 'final') else None
-        if name_upper == 'COUNT':
-            if star:
-                return len(values)
-            return sum(1 for v in values if v is not None)
-        elif name_upper in ('SUM', 'TOTAL'):
-            total = 0
-            for v in values:
-                if isinstance(v, (int, float)):
-                    total += v
-            return total
-        elif name_upper == 'AVG':
-            total = 0
-            count = 0
-            for v in values:
-                if isinstance(v, (int, float)):
-                    total += v
-                    count += 1
-            return total / count if count else 0
-        elif name_upper == 'MIN':
-            non_null = [v for v in values if v is not None]
-            return min(non_null) if non_null else None
-        elif name_upper == 'MAX':
-            non_null = [v for v in values if v is not None]
-            return max(non_null) if non_null else None
-        elif name_upper == 'GROUP_CONCAT':
-            separator = ','
-            if values and isinstance(values[0], tuple):
-                items = [str(v[0]) for v in values if v[0] is not None]
-                if values[0] and len(values[0]) > 1 and values[0][1] is not None:
-                    separator = str(values[0][1])
-            else:
-                items = [str(v) for v in values if v is not None]
-            return separator.join(items) if items else None
-        elif name_upper == 'JSON_GROUP_ARRAY':
-            import json as _json
-            items = [v for v in values if v is not None]
-            return _json.dumps(items, separators=(',', ':'))
-        elif name_upper == 'JSON_GROUP_OBJECT':
-            import json as _json
-            obj = {}
-            for v in values:
-                if isinstance(v, tuple) and len(v) >= 2:
-                    key = str(v[0]) if v[0] is not None else None
-                    if key is not None:
-                        obj[key] = v[1]
-            return _json.dumps(obj, separators=(',', ':')) if obj else '{}'
-        return len(values)
+        from pysqlite.functions.aggregate import compute_aggregate as _ca
+        return _ca(name, values, star, self.custom_aggregates)
 
     def _op_FkUpdate(self, P1: int, P2: int, P3: int, P4: Any, P5: int):
         if not isinstance(P4, dict) or not P4.get('fk_info'):
@@ -1876,6 +1755,19 @@ class VM:
                 self._set_reg(P3, self._reg(i))
                 return
         self._set_reg(P3, Register())
+
+    def _op_Distinct(self, P1: int, P2: int, P3: int, P4: Any, P5: int):
+        self.distinct = True
+
+    def _dedup_results(self):
+        seen = set()
+        deduped = []
+        for row in self.result_rows:
+            key = tuple(row)
+            if key not in seen:
+                seen.add(key)
+                deduped.append(row)
+        self.result_rows = deduped
 
     def _op_LastInsertRowid(self, P1: int, P2: int, P3: int, P4: Any, P5: int):
         self._set_reg(P1, Register(RegisterType.INT, self.last_rowid))

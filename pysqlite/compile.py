@@ -14,7 +14,7 @@ from pysqlite.ast import (
     CreateView, DropView, CreateTrigger, DropTrigger, AlterTable,
     CreateVirtualTable,
     Begin, Commit, RollbackStmt, Savepoint, Release,
-    Pragma, Explain, Analyze,
+    Pragma, Explain, Analyze, Reindex, Vacuum,
     Literal, NullLiteral, ColumnRef, UnaryOp, BinaryOp,
     FunctionCall, CaseExpr, CastExpr, Subquery, ExistsSubquery,
     InOp, BetweenOp, LikeOp, IsOp, IsNullOp, CollateOp,
@@ -26,10 +26,10 @@ from pysqlite.ast import (
 )
 
 
-AGGREGATE_FUNCTIONS = frozenset({'COUNT', 'SUM', 'AVG', 'MIN', 'MAX', 'GROUP_CONCAT', 'TOTAL', 'JSON_GROUP_ARRAY', 'JSON_GROUP_OBJECT'})
+from pysqlite.functions import AGGREGATE_FUNCTIONS, is_aggregate_name as _builtin_is_aggregate
 
 def _is_aggregate_name(name: str, custom_aggregates: set[str] | None = None) -> bool:
-    return name.upper() in AGGREGATE_FUNCTIONS or (
+    return _builtin_is_aggregate(name) or (
         custom_aggregates is not None and name.upper() in custom_aggregates
     )
 
@@ -52,6 +52,7 @@ class Compiler:
         self.next_cursor = 0
         self.loop_break_label: str | None = None
         self._col_reg_map: dict[str, int] | None = None  # {col_name_upper: reg} for generated cols
+        self.cte_defs: dict[str, Select] = {}  # CTE name -> SELECT AST
 
         self.reg_zero = self.alloc_reg()
         self.reg_one = self.alloc_reg()
@@ -73,6 +74,14 @@ class Compiler:
         c = self.next_cursor
         self.next_cursor += 1
         return c
+
+    def _compact_regs(self, regs: list[int]) -> list[int]:
+        if not regs:
+            return []
+        first = self.alloc_regs(len(regs))[0]
+        for i, r in enumerate(regs):
+            self.emit(Opcode.MemCopy, P1=r, P2=first + i, comment='compact val')
+        return list(range(first, first + len(regs)))
 
     # ── Label management ──
 
@@ -186,6 +195,16 @@ class Compiler:
             self._compile_explain(statement)
         elif isinstance(statement, Analyze):
             self._compile_analyze(statement)
+        elif isinstance(statement, AlterTable):
+            self._compile_alter_table(statement)
+        elif isinstance(statement, Savepoint):
+            self._compile_savepoint(statement)
+        elif isinstance(statement, Release):
+            self._compile_release(statement)
+        elif isinstance(statement, Reindex):
+            self._compile_reindex(statement)
+        elif isinstance(statement, Vacuum):
+            self._compile_vacuum(statement)
         else:
             raise CompilerError(f'Unsupported statement: {type(statement).__name__}')
 
@@ -427,20 +446,20 @@ class Compiler:
             lo_reg = self.compile_expr(expr.low, cursor)
             hi_reg = self.compile_expr(expr.high, cursor)
             inner = self.compile_expr(expr.expr, cursor)
-            ge_reg = self.alloc_reg()
-            le_reg = self.alloc_reg()
-            self.emit(Opcode.Ge, P1=inner, P2=ge_reg, P3=lo_reg, comment='BETWEEN low')
-            self.emit(Opcode.Le, P1=inner, P2=le_reg, P3=hi_reg, comment='BETWEEN high')
-            if expr.negated:
-                self.emit(Opcode.And, P1=ge_reg, P2=le_reg, P3=reg)
-                self.emit(Opcode.Not, P1=reg, P2=reg)
-            else:
-                self.emit(Opcode.And, P1=ge_reg, P2=le_reg, P3=reg)
+            fail = self._label_name('between_fail')
+            end = self._label_name('between_end')
+            self.emit_compare_branch(Opcode.Lt, inner, lo_reg, fail)
+            self.emit_compare_branch(Opcode.Gt, inner, hi_reg, fail)
+            self.emit(Opcode.Integer, P1=int(not expr.negated), P2=reg, comment='BETWEEN true')
+            self.emit_goto(end)
+            self.define_label(fail)
+            self.emit(Opcode.Integer, P1=int(expr.negated), P2=reg, comment='BETWEEN false')
+            self.define_label(end)
 
         elif isinstance(expr, LikeOp):
             left = self.compile_expr(expr.expr, cursor)
             right = self.compile_expr(expr.pattern, cursor)
-            self.emit(Opcode.Like, P1=left, P3=reg, P4=1, comment='LIKE')
+            self.emit(Opcode.Like, P1=right, P2=left, P3=reg, P4=1, comment='LIKE')
             if expr.negated:
                 self.emit(Opcode.Not, P1=reg, P2=reg)
 
@@ -867,7 +886,11 @@ class Compiler:
         self._expand_views(node)
         if node.ctes:
             self._compile_cte(node.ctes)
+            self._expand_ctes(node)
         cursor = self.alloc_cursor()
+
+        if node.distinct:
+            self.emit(Opcode.Distinct, comment='SELECT DISTINCT')
 
         # If aggregates or GROUP BY, use aggregation compiler
         if self._has_aggregates(node) and not self._has_window_functions(node):
@@ -903,8 +926,10 @@ class Compiler:
                     if node.compound_select:
                         self._compile_compound(node)
                     return
-                self.emit(Opcode.Rewind, P1=cursor, P2=len(self.instructions) + 4,
+                rewind_target = self._label_name('rewind_target')
+                self.emit(Opcode.Rewind, P1=cursor, P2=0,
                           comment='rewind')
+                self._patch_jump(len(self.instructions) - 1, rewind_target)
             elif isinstance(table_ref, SubqueryTable):
                 sub_select = table_ref.select
                 from pysqlite.schema import AFFINITY
@@ -946,16 +971,48 @@ class Compiler:
             self.emit(Opcode.OpenEphemeral, P1=cursor, P2=1,
                       comment='dummy scan')
 
+        # LIMIT / OFFSET expressions (compile once before loop)
+        if node.limit:
+            limit_reg = self.compile_expr(node.limit, cursor)
+        if node.offset:
+            offset_reg = self.compile_expr(node.offset, cursor)
+
         # WHERE clause
         loop_start = len(self.instructions)
         if node.from_clause:
             pass  # Rewind already positions cursor, Next handles loop
 
-        where_skip = None
+        loop_continue = None
+        if node.where or node.limit or node.offset:
+            loop_continue = self._label_name('loop_cont')
+        result_label = self._label_name('result_label') if node.limit or node.offset else None
+        end_label = self._label_name('select_end') if node.limit or node.offset else None
+
         if node.where:
             where_reg = self.compile_expr(node.where, cursor)
-            where_skip = self._label_name('where_skip')
-            self.emit_ifnot(where_reg, where_skip)
+            self.emit_ifnot(where_reg, loop_continue)
+
+        # OFFSET check (before ResultRow): skip ResultRow while offset > 0
+        if node.offset:
+            off_nn = self._label_name('off_nn')
+            self.emit_notnull(offset_reg, off_nn)
+            self.emit_goto(result_label)  # null offset → emit immediately
+            self.define_label(off_nn)
+            idx = self.emit(Opcode.IfNotZero, P1=offset_reg, P3=1, comment='offset skip')
+            self._patch_jump(idx, loop_continue)
+
+        # LIMIT check (before ResultRow): stop when limit exhausted
+        if node.limit:
+            lim_nn = self._label_name('lim_nn')
+            self.emit_notnull(limit_reg, lim_nn)
+            self.emit_goto(result_label)  # null limit → emit unconditionally
+            self.define_label(lim_nn)
+            idx = self.emit(Opcode.IfNotZero, P1=limit_reg, P3=1, comment='limit check')
+            self._patch_jump(idx, result_label)
+            self.emit_goto(end_label)
+
+        if result_label:
+            self.define_label(result_label)
 
         # Result columns
         self._current_select_columns = node.columns
@@ -1006,23 +1063,20 @@ class Compiler:
 
         self.emit(Opcode.ResultRow, P1=first_reg, P2=n_cols, comment='emit row')
 
-        if where_skip:
-            self.define_label(where_skip)
-
-        # LIMIT / OFFSET
-        if node.limit or node.offset:
-            if node.limit:
-                limit_reg = self.compile_expr(node.limit, cursor)
-            else:
-                limit_reg = self.reg_null
-            if node.offset:
-                offset_reg = self.compile_expr(node.offset, cursor)
-                self.emit(Opcode.IfNotZero, P1=offset_reg, P2=0, P3=1,
-                          comment='skip offset')
+        if loop_continue:
+            self.define_label(loop_continue)
 
         # Loop
         if node.from_clause:
             self.emit(Opcode.Next, P1=cursor, P2=loop_start, comment='next row')
+
+        if node.limit or node.offset:
+            self.define_label(end_label)
+
+        if node.from_clause:
+            ref = node.from_clause[0]
+            if isinstance(ref, TableName):
+                self.define_label(rewind_target)
 
         # Compound (UNION/INTERSECT/EXCEPT)
         if node.compound_select:
@@ -1096,6 +1150,9 @@ class Compiler:
 
     def _compile_aggregation(self, node: Select, cursor: int):
         self._expand_views(node)
+        if node.ctes:
+            self._compile_cte(node.ctes)
+            self._expand_ctes(node)
         if node.from_clause:
             table_ref = node.from_clause[0]
             if isinstance(table_ref, TableName):
@@ -1225,6 +1282,9 @@ class Compiler:
 
     def _compile_window(self, node: Select, cursor: int):
         self._expand_views(node)
+        if node.ctes:
+            self._compile_cte(node.ctes)
+            self._expand_ctes(node)
         if node.from_clause:
             table_ref = node.from_clause[0]
             if isinstance(table_ref, TableName):
@@ -1533,36 +1593,39 @@ class Compiler:
                             pass
                 else:
                     col_provided = {vi: vi for vi in range(n_user)}
-                # Separate exact INTEGER PK (rowid alias) from user-provided values
+                # Reorder val_regs to match table column order
                 pk_val_reg = None
-                if rowid_alias_col is not None and rowid_alias_col in col_provided:
-                    pk_vi = col_provided.pop(rowid_alias_col)
-                    pk_val_reg = val_regs[pk_vi]
                 gen_map = {}
+                new_val_regs = []
                 for ci, col in enumerate(td.columns):
                     if ci == rowid_alias_col:
+                        if ci in col_provided:
+                            pk_val_reg = val_regs[col_provided[ci]]
                         continue
                     if ci in col_provided:
-                        gen_map[col.name.upper()] = val_regs[col_provided[ci]]
+                        vr = val_regs[col_provided[ci]]
+                        if col.not_null:
+                            null_label = self._label_name('notnull_ok')
+                            self.emit_if(vr, null_label)
+                            self.emit(Opcode.Halt, P1=-1, comment='NOT NULL constraint failed')
+                            self.define_label(null_label)
+                        new_val_regs.append(vr)
+                        gen_map[col.name.upper()] = vr
                     elif col.is_generated and col.generated_type == 'STORED':
                         self._col_reg_map = dict(gen_map)
                         vr = self.compile_expr(col.generated_expr, 0)
                         self._col_reg_map = None
-                        val_regs.append(vr)
+                        new_val_regs.append(vr)
                         gen_map[col.name.upper()] = vr
                     elif col.is_generated and col.generated_type == 'VIRTUAL':
                         vr = self.alloc_reg()
                         self.emit(Opcode.Null, P1=vr, comment='VIRTUAL placeholder')
-                        val_regs.append(vr)
-                # Compact val_regs to be contiguous for MakeRecord
-                n_total = len(val_regs)
-                if n_total > 0:
-                    first = val_regs[0]
-                    for i, r in enumerate(val_regs):
-                        if r != first + i:
-                            self.emit(Opcode.MemCopy, P1=r, P2=first + i,
-                                      comment='compact val')
-                    val_regs = list(range(first, first + n_total))
+                        new_val_regs.append(vr)
+                    else:
+                        vr = self.alloc_reg()
+                        self.emit(Opcode.Null, P1=vr, comment='default NULL')
+                        new_val_regs.append(vr)
+                val_regs = self._compact_regs(new_val_regs)
                 rowid_reg = self.alloc_reg()
                 if td.without_rowid:
                     wr_pk = self._get_any_pk_column(td)
@@ -1611,11 +1674,23 @@ class Compiler:
                 record_reg = self.alloc_reg()
                 self.emit(Opcode.MakeRecord, P1=first_val, P2=len(val_regs),
                           P3=record_reg, comment='make record')
+                do_replace = node.or_action == 'REPLACE'
                 do_update = node.on_conflict is not None and node.on_conflict.action == 'UPDATE'
                 do_nothing = (node.on_conflict is not None and node.on_conflict.action == 'NOTHING') or node.or_action == 'IGNORE'
                 if do_nothing:
                     self.emit(Opcode.NoConflictInsert, P1=cursor, P2=record_reg, P3=rowid_reg,
                               comment='insert or ignore')
+                elif do_replace:
+                    no_conflict_label = self._label_name('replace_no_conflict')
+                    idx = self.emit(Opcode.SeekRowid, P1=cursor, P2=0, P3=rowid_reg,
+                                   comment='seek for replace; jump if not found')
+                    self._patch_jump(idx, no_conflict_label)
+                    self.emit(Opcode.Delete, P1=cursor, comment='delete old row for REPLACE')
+                    self.define_label(no_conflict_label)
+                    self.emit(Opcode.MakeRecord, P1=first_val, P2=len(val_regs),
+                              P3=record_reg, comment='make record')
+                    self.emit(Opcode.Insert, P1=cursor, P2=record_reg, P3=rowid_reg,
+                              comment='insert row (replace)')
                 elif do_update:
                     # SeekRowid P2=jump if NOT found (no conflict → normal insert)
                     no_conflict_label = self._label_name('upsert_no_conflict')
@@ -1689,8 +1764,10 @@ class Compiler:
 
     def _compile_insert_select(self, select: Select, dest_cursor: int, td: 'TableDef',
                                 returning: Returning | None = None):
+        self._expand_ctes(select)
         if select.ctes:
             self._compile_cte(select.ctes)
+            self._expand_ctes(select)
         src_cursor = self.alloc_cursor()
         if select.from_clause:
             table_ref = select.from_clause[0]
@@ -1701,6 +1778,38 @@ class Compiler:
                 src_rd_info = {'without_rowid': True} if src_td.without_rowid else None
                 self.emit(Opcode.OpenRead, P1=src_cursor, P2=src_td.root_page,
                           P3=len(src_td.columns), P4=src_rd_info, comment=f'open {src_td.name}')
+                self.emit(Opcode.Rewind, P1=src_cursor, P2=len(self.instructions) + 4,
+                          comment='rewind')
+            elif isinstance(table_ref, SubqueryTable):
+                sub_cols = []
+                for rc in table_ref.select.columns:
+                    if isinstance(rc.expr, StarExpr):
+                        if table_ref.select.from_clause:
+                            inner_ref = table_ref.select.from_clause[0]
+                            if isinstance(inner_ref, TableName):
+                                inner_td = self._lookup_table_def(inner_ref.name, inner_ref.schema)
+                                for col in inner_td.columns:
+                                    sub_cols.append(ColumnDef(name=col.name, affinity=AFFINITY.BLOB))
+                            else:
+                                cname = f'col_{len(sub_cols)}'
+                                sub_cols.append(ColumnDef(name=cname, affinity=AFFINITY.BLOB))
+                        else:
+                            cname = f'col_{len(sub_cols)}'
+                            sub_cols.append(ColumnDef(name=cname, affinity=AFFINITY.BLOB))
+                    elif rc.alias:
+                        cname = rc.alias
+                        sub_cols.append(ColumnDef(name=cname, affinity=AFFINITY.BLOB))
+                    elif isinstance(rc.expr, ColumnRef):
+                        cname = rc.expr.name
+                        sub_cols.append(ColumnDef(name=cname, affinity=AFFINITY.BLOB))
+                    else:
+                        cname = f'col_{len(sub_cols)}'
+                        sub_cols.append(ColumnDef(name=cname, affinity=AFFINITY.BLOB))
+                src_td = TableDef(name=table_ref.alias or '_sub', columns=sub_cols, root_page=0, sql='')
+                self.cursor_table[src_cursor] = src_td
+                self.emit(Opcode.Transaction, P1=0, comment='begin read')
+                self.emit(Opcode.OpenEphemeral, P1=src_cursor, P2=1, comment='subquery for insert')
+                self._compile_subquery_fill(table_ref.select, src_cursor, sub_cols)
                 self.emit(Opcode.Rewind, P1=src_cursor, P2=len(self.instructions) + 4,
                           comment='rewind')
         else:
@@ -1754,17 +1863,22 @@ class Compiler:
     def _compile_subquery_fill(self, sub_select: Select, target_cursor: int, sub_cols: list):
         """Compile a subquery to fill an ephemeral table (for SubqueryTable in FROM)."""
         src_cursor = self.alloc_cursor()
+        if sub_select.ctes:
+            self._compile_cte(sub_select.ctes)
+            self._expand_ctes(sub_select)
         if sub_select.from_clause:
             src_ref = sub_select.from_clause[0]
             if isinstance(src_ref, TableName):
                 src_td = self._lookup_table_def(src_ref.name, src_ref.schema)
                 self.cursor_table[src_cursor] = src_td
                 self.emit(Opcode.Transaction, P1=0, comment='begin read')
-                src_rd_info = {'without_rowid': True} if src_td.without_rowid else None
+                src_rd_info = {'without_rowid': True} if src_td and src_td.without_rowid else None
                 self.emit(Opcode.OpenRead, P1=src_cursor, P2=src_td.root_page,
                           P3=len(src_td.columns), P4=src_rd_info, comment=f'open {src_td.name}')
                 self.emit(Opcode.Rewind, P1=src_cursor, P2=len(self.instructions) + 4,
                           comment='rewind')
+            elif isinstance(src_ref, SubqueryTable):
+                self.emit(Opcode.OpenEphemeral, P1=src_cursor, P2=1, comment='subquery')
             else:
                 self.emit(Opcode.OpenEphemeral, P1=src_cursor, P2=1, comment='dummy scan')
         else:
@@ -1972,8 +2086,14 @@ class Compiler:
         del_info = {'without_rowid': True} if td.without_rowid else None
         self.emit(Opcode.OpenWrite, P1=cursor, P2=td.root_page,
                   P3=len(td.columns), P4=del_info, comment=f'open {td.name}')
-        self.emit(Opcode.Rewind, P1=cursor, P2=0, comment='rewind')
+        end_label = self._label_name('delete_end')
+        rewind_idx = self.emit(Opcode.Rewind, P1=cursor, P2=0, comment='rewind')
         loop_start = len(self.instructions)
+
+        # Check if cursor is still valid (not past end after deletion)
+        rowid_reg = self.alloc_reg()
+        self.emit(Opcode.Rowid, P1=cursor, P2=rowid_reg, comment='check eof')
+        self.emit_isnull(rowid_reg, end_label)
 
         if node.where:
             where_reg = self.compile_expr(node.where, cursor)
@@ -1983,9 +2103,49 @@ class Compiler:
         if node.returning:
             self._compile_returning(cursor, node.returning)
         self.emit(Opcode.Delete, P1=cursor, comment='delete row')
+        self.emit(Opcode.Goto, P1=loop_start, comment='loop back')
         if node.where:
             self.define_label(skip_label)
         self.emit(Opcode.Next, P1=cursor, P2=loop_start, comment='next row')
+        self.define_label(end_label)
+        self.instructions[rewind_idx].P2 = self.labels[end_label]
+
+    # ── ALTER TABLE ──
+
+    def _compile_alter_table(self, node: AlterTable):
+        td = self._lookup_table_def(node.table.name, node.table.schema)
+        action = node.action
+        if action == 'RENAME TO':
+            old_key = next((k for k in self.schema.tables if k.upper() == node.table.name.upper()), node.table.name)
+            td.name = node.new_name
+            self.schema.tables[node.new_name] = self.schema.tables.pop(old_key)
+        elif action == 'RENAME COLUMN':
+            for col in td.columns:
+                if col.name.upper() == node.column.upper():
+                    col.name = node.new_column
+                    break
+        elif action == 'ADD COLUMN':
+            col_ast = node.column_def
+            aff = self.schema._determine_affinity(col_ast.type_name)
+            dflt = None
+            for c in col_ast.constraints:
+                if c.kind == 'DEFAULT':
+                    dflt = c.details
+                    break
+            new_col = ColumnDef(
+                name=col_ast.name,
+                affinity=aff,
+                type_name=col_ast.type_name,
+                not_null=any(c.kind == 'NOT NULL' for c in col_ast.constraints),
+                default_value=dflt,
+            )
+            td.columns.append(new_col)
+        elif action == 'DROP COLUMN':
+            for i, col in enumerate(td.columns):
+                if col.name.upper() == node.column.upper():
+                    td.columns.pop(i)
+                    break
+        self.emit(Opcode.Integer, P1=0, P2=self.reg_zero, comment='success')
 
     # ── DDL ──
 
@@ -2525,6 +2685,26 @@ class Compiler:
                   P2=reg, comment=f'PRAGMA {node.name}')
         self.emit(Opcode.ResultRow, P1=reg, P2=1, comment='pragma result')
 
+    # ── SAVEPOINT ──
+
+    def _compile_savepoint(self, node: Savepoint):
+        self.emit(Opcode.Savepoint, P4=node.name, comment=f'SAVEPOINT {node.name}')
+
+    # ── RELEASE ──
+
+    def _compile_release(self, node: Release):
+        self.emit(Opcode.Release, P4=node.savepoint, comment=f'RELEASE {node.savepoint}')
+
+    # ── REINDEX ──
+
+    def _compile_reindex(self, node: Reindex):
+        self.emit(Opcode.Noop, comment=f'REINDEX (stub - index rebuilt on use)')
+
+    # ── VACUUM ──
+
+    def _compile_vacuum(self, node: Vacuum):
+        self.emit(Opcode.Noop, comment='VACUUM (stub - no-op in memory mode)')
+
     # ── ANALYZE ──
 
     def _compile_analyze(self, node: Analyze):
@@ -2569,7 +2749,32 @@ class Compiler:
     # ── CTE ──
 
     def _compile_cte(self, ctes: list[CTE]):
-        pass  # Placeholder — will implement when needed
+        from pysqlite.ast import SubqueryTable as _SubqueryTable
+        for cte in ctes:
+            self.cte_defs[cte.name.upper()] = cte.select
+
+    def _expand_ctes(self, node: Select):
+        if not self.cte_defs:
+            return
+        from pysqlite.ast import SubqueryTable as _SubqueryTable
+        if node.from_clause:
+            new_from = []
+            for ref in node.from_clause:
+                if isinstance(ref, list):
+                    new_inner = []
+                    for r in ref:
+                        if isinstance(r, TableName) and r.name.upper() in self.cte_defs:
+                            sub = _SubqueryTable(select=self.cte_defs[r.name.upper()], alias=r.name)
+                            new_inner.append(sub)
+                        else:
+                            new_inner.append(r)
+                    new_from.append(new_inner)
+                elif isinstance(ref, TableName) and ref.name.upper() in self.cte_defs:
+                    sub = _SubqueryTable(select=self.cte_defs[ref.name.upper()], alias=ref.name)
+                    new_from.append(sub)
+                else:
+                    new_from.append(ref)
+            node.from_clause = new_from
 
     # ── View expansion ──
 

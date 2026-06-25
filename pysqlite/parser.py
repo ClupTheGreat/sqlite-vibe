@@ -67,8 +67,30 @@ class Parser:
             return self._parse_drop()
         if tt in (TokenType.ALTER,):
             return self._parse_alter()
-        if tt in (TokenType.SELECT, TokenType.WITH):
+        if tt in (TokenType.SELECT,):
             return self._parse_select()
+        if tt in (TokenType.WITH,):
+            saved = self.idx
+            ctes = self._parse_cte()
+            tt = self.peek()
+            if tt == TokenType.SELECT:
+                stmt = self._parse_select()
+                stmt.ctes = ctes
+                return stmt
+            if tt == TokenType.INSERT:
+                stmt = self._parse_insert()
+                stmt.ctes = ctes
+                return stmt
+            if tt == TokenType.UPDATE:
+                stmt = self._parse_update()
+                stmt.ctes = ctes
+                return stmt
+            if tt == TokenType.DELETE:
+                stmt = self._parse_delete()
+                stmt.ctes = ctes
+                return stmt
+            self.idx = saved
+            raise ParseError(f"Unexpected token after WITH: {tt.name}")
         if tt in (TokenType.INSERT,):
             return self._parse_insert()
         if tt in (TokenType.UPDATE,):
@@ -567,7 +589,7 @@ class Parser:
                 action = 'RENAME COLUMN'
                 column = self.expect(TokenType.IDENTIFIER).value
                 self.expect(TokenType.TO)
-                new_name = self.expect(TokenType.IDENTIFIER).value
+                new_column = self.expect(TokenType.IDENTIFIER).value
         return AlterTable(table=table, action=action, new_name=new_name,
                           column=column, new_column=new_column,
                           column_def=column_def)
@@ -1247,7 +1269,14 @@ class Parser:
                 val = val[1:-1]
             return Literal(val)
         if tt == TokenType.BLOB:
-            return Literal(self.advance().value)
+            raw = self.advance().value
+            if raw.startswith("x'") and raw.endswith("'"):
+                hex_str = raw[2:-1]
+                try:
+                    return Literal(bytes.fromhex(hex_str))
+                except ValueError:
+                    return Literal(raw)
+            return Literal(raw)
         raise ParseError(f"Expected literal, got {tt.name}")
 
     def _parse_function_call(self, name: str) -> FunctionCall:
