@@ -106,7 +106,7 @@
 [ ] 7.7 Window functions (ROW_NUMBER, RANK, LAG, LEAD, NTILE, etc.)
 [x] 7.8 Views (CREATE/DROP, expansion with column rewriting)
 [ ] 7.9 Triggers (BEFORE/AFTER/INSTEAD OF, OLD/NEW)
-[ ] 7.10 UPSERT (ON CONFLICT DO NOTHING/UPDATE)
+[x] 7.10 UPSERT (ON CONFLICT DO NOTHING + INSERT OR IGNORE)
 [x] 7.11 RETURNING clause (INSERT/UPDATE/DELETE with SeekRowid + ResultRow)
 [ ] 7.12 WITHOUT ROWID tables
 [ ] 7.13 STRICT tables

@@ -279,10 +279,22 @@ When you encounter a problem during development, add an entry like:
     ORDER BY) to use the view's defining expressions. View WHERE clauses
     are merged into the outer query via AND. Limitations: (1) DROP VIEW
     only removes from in-memory Schema dict, not from sqlite_schema B-Tree
-    (same limitation as DROP TABLE/DROP INDEX). (2) SubqueryTable in FROM
-    compiling is still broken (inlines sub-program with Halt, terminating VM).
-    Views avoid this by doing column-level AST rewriting instead of
-    SubqueryTable expansion.
+     (same limitation as DROP TABLE/DROP INDEX). (2) SubqueryTable in FROM
+     compiling was broken (inlines sub-program with Halt, terminating VM).
+     Fixed 2026-06-25: replaced with _compile_subquery_fill that opens source
+     table, iterates, and fills ephemeral with MakeRecord/Insert/Next loop.
+     Views avoid this by doing column-level AST rewriting instead of
+     SubqueryTable expansion.
+
+[2026-06-25] OSVFS lock test skipped on Windows (test_vfs.py:183)
+  - File: tests/unit/test_vfs.py:183-192
+  - Severity: low
+  - Details: test_lock_shared and related lock tests are marked
+    @pytest.mark.skip(reason="Windows locking needs refinement").
+    LockFileEx with OVERLAPPED hangs on Python 3.13/Windows.
+    Need to investigate correct OVERLAPPED setup or use alternative
+    locking via msvcrt.locking(). Not blocking any SQL functionality.
 ```
+
 
 
