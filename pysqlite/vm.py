@@ -1658,6 +1658,142 @@ class VM:
             return _json.dumps(obj, separators=(',', ':')) if obj else '{}'
         return len(values)
 
+    def _op_FkUpdate(self, P1: int, P2: int, P3: int, P4: Any, P5: int):
+        if not isinstance(P4, dict) or not P4.get('fk_info'):
+            return
+        fk_info = P4['fk_info']
+        old_regs = P4.get('old_regs', [])
+        new_regs = P4.get('new_regs', [])
+        n = min(len(old_regs), len(new_regs))
+        if n == 0:
+            return
+
+        old_vals = [self._reg(r).value for r in old_regs]
+        new_vals = [self._reg(r).value for r in new_regs]
+
+        # For RESTRICT: check before the update
+        mode = P4.get('mode', '')
+        if mode == 'restrict_check':
+            if old_vals != new_vals:
+                schema = self.tx.schema if self.tx else None
+                if not schema:
+                    return
+                child_name = fk_info['child_table']
+                child_td = schema.get_table(child_name)
+                if child_td:
+                    from pysqlite.btree import BTree
+                    from pysqlite.record import Record
+                    child_bt = BTree(self.pager, child_td.root_page, is_table=True)
+                    child_cursor = child_bt.cursor()
+                    child_cursor.first()
+                    while not child_cursor.eof:
+                        payload = child_cursor.current_payload()
+                        rec, _ = Record.decode(payload)
+                        child_vals = rec.get_values()
+                        match = True
+                        for j, cc in enumerate(fk_info['child_columns']):
+                            try:
+                                c_idx = child_td.column_index(cc)
+                            except ValueError:
+                                match = False
+                                break
+                            if c_idx >= len(child_vals) or child_vals[c_idx] != old_vals[j]:
+                                match = False
+                                break
+                        if match:
+                            from pysqlite.errors import ConstraintForeignKeyError
+                            raise ConstraintForeignKeyError("FOREIGN KEY constraint failed")
+                        child_cursor.next()
+            return
+
+        if old_vals == new_vals:
+            return
+
+        schema = self.tx.schema if self.tx else None
+        if not schema:
+            return
+
+        child_name = fk_info['child_table']
+        child_td = schema.get_table(child_name)
+        if not child_td:
+            return
+
+        child_columns = fk_info['child_columns']
+        action = fk_info['action']
+
+        from pysqlite.btree import BTree
+        from pysqlite.record import Record
+        from pysqlite.ast import Literal as AstLiteral
+
+        child_bt = BTree(self.pager, child_td.root_page, is_table=True)
+        child_cursor = child_bt.cursor()
+        child_cursor.first()
+
+        updates = []
+        while not child_cursor.eof:
+            payload = child_cursor.current_payload()
+            rec, _ = Record.decode(payload)
+            child_vals = rec.get_values()
+            rowid = child_cursor.current_key()
+
+            match = True
+            for j, cc in enumerate(child_columns):
+                try:
+                    c_idx = child_td.column_index(cc)
+                except ValueError:
+                    match = False
+                    break
+                if c_idx >= len(child_vals) or child_vals[c_idx] != old_vals[j]:
+                    match = False
+                    break
+
+            if match:
+                if action == 'CASCADE':
+                    new_child_vals = list(child_vals)
+                    for j, cc in enumerate(child_columns):
+                        try:
+                            c_idx = child_td.column_index(cc)
+                            if c_idx < len(new_child_vals):
+                                new_child_vals[c_idx] = new_vals[j]
+                        except ValueError:
+                            pass
+                    updates.append((rowid, new_child_vals))
+                elif action == 'SET NULL':
+                    new_child_vals = list(child_vals)
+                    for cc in child_columns:
+                        try:
+                            c_idx = child_td.column_index(cc)
+                            if c_idx < len(new_child_vals):
+                                new_child_vals[c_idx] = None
+                        except ValueError:
+                            pass
+                    updates.append((rowid, new_child_vals))
+                elif action == 'SET DEFAULT':
+                    new_child_vals = list(child_vals)
+                    for cc in child_columns:
+                        try:
+                            c_idx = child_td.column_index(cc)
+                            dv = child_td.columns[c_idx].default_value if c_idx < len(child_td.columns) else None
+                            if isinstance(dv, AstLiteral):
+                                dv = dv.value
+                            new_child_vals[c_idx] = dv if dv is not None else None
+                        except ValueError:
+                            pass
+                    updates.append((rowid, new_child_vals))
+
+            child_cursor.next()
+
+        for rowid, new_vals in updates:
+            del_cursor = child_bt.cursor()
+            del_cursor.first()
+            while not del_cursor.eof:
+                if del_cursor.current_key() == rowid:
+                    del_cursor.delete()
+                    break
+                del_cursor.next()
+            new_rec = Record.encode_from_values(new_vals)
+            child_bt.cursor().insert(rowid, rowid, new_rec)
+
     def _op_Noop(self, P1: int, P2: int, P3: int, P4: Any, P5: int):
         pass
 

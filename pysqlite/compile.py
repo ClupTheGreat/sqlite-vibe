@@ -1262,6 +1262,38 @@ class Compiler:
                   P3=len(td.columns), P4=table_info, comment=f'open {td.name}')
         self.emit(Opcode.Rewind, P1=cursor, P2=0, comment='rewind')
 
+        # Find FK relationships where this table is the parent (for ON UPDATE cascade)
+        fk_update_info = []
+        fk_restrict_actions = []
+        if self.schema:
+            for child_name, child_td in list(self.schema.tables.items()):
+                for fk in child_td.foreign_keys:
+                    if fk.table == td.name:
+                        update_action = fk.actions.get('UPDATE', 'RESTRICT')
+                        parent_cols = fk.parent_columns or fk.columns
+                        col_indices = []
+                        for pc in parent_cols:
+                            try:
+                                col_indices.append(td.column_index(pc))
+                            except ValueError:
+                                col_indices.append(-1)
+                        if update_action in ('CASCADE', 'SET NULL', 'SET DEFAULT'):
+                            fk_update_info.append({
+                                'child_table': child_name,
+                                'child_columns': list(fk.columns),
+                                'parent_columns': list(parent_cols),
+                                'parent_indices': col_indices,
+                                'action': update_action,
+                            })
+                        elif update_action == 'RESTRICT':
+                            fk_restrict_actions.append({
+                                'child_table': child_name,
+                                'child_columns': list(fk.columns),
+                                'parent_columns': list(parent_cols),
+                                'parent_indices': col_indices,
+                                'action': 'RESTRICT',
+                            })
+
         loop_start = len(self.instructions)
         if node.where:
             where_reg = self.compile_expr(node.where, cursor)
@@ -1276,6 +1308,19 @@ class Compiler:
         for i in range(n_cols):
             self.emit(Opcode.Column, P1=cursor, P2=i, P3=col_regs[i],
                       comment=f'read col {i}')
+
+        # Save old FK column values for ON UPDATE cascade
+        fk_old_regs = []
+        all_fk_actions = fk_update_info + fk_restrict_actions
+        if all_fk_actions:
+            for fk_info in all_fk_actions:
+                for ci in fk_info['parent_indices']:
+                    r = self.alloc_reg()
+                    fk_old_regs.append(r)
+                    if ci >= 0 and ci < len(col_regs):
+                        self.emit(Opcode.MemCopy, P1=col_regs[ci], P2=r,
+                                  comment=f'save old FK col {ci}')
+
         for sc in node.set_clauses:
             col_idx = -1
             try:
@@ -1287,6 +1332,21 @@ class Compiler:
                 if set_reg != col_regs[col_idx]:
                     self.emit(Opcode.MemCopy, P1=set_reg, P2=col_regs[col_idx],
                               comment=f'set {sc.column}')
+
+        # ON UPDATE RESTRICT check BEFORE the delete
+        if fk_restrict_actions:
+            offset = len(fk_old_regs) - sum(len(a['parent_indices']) for a in fk_restrict_actions)
+            for i, fk_info in enumerate(fk_restrict_actions):
+                n_fk_cols = len(fk_info['parent_indices'])
+                old_regs = fk_old_regs[offset:offset + n_fk_cols]
+                offset += n_fk_cols
+                new_regs = [col_regs[ci] for ci in fk_info['parent_indices']]
+                self.emit(Opcode.FkUpdate, P1=0, P2=0, P3=n_fk_cols,
+                          P4={'fk_info': fk_info, 'td_name': td.name,
+                              'old_regs': old_regs, 'new_regs': new_regs,
+                              'mode': 'restrict_check'},
+                          comment='ON UPDATE RESTRICT check')
+
         self.emit(Opcode.Delete, P1=cursor, comment='delete old row')
 
         # Insert updated row
@@ -1296,6 +1356,19 @@ class Compiler:
                   P3=record_reg, comment='update record')
         self.emit(Opcode.Insert, P1=cursor, P2=record_reg, P3=rowid_reg,
                   comment='insert updated row')
+
+        # ON UPDATE cascade: if FK columns changed, update children
+        if fk_update_info:
+            offset = 0
+            for i, fk_info in enumerate(fk_update_info):
+                n_fk_cols = len(fk_info['parent_indices'])
+                old_regs = fk_old_regs[offset:offset + n_fk_cols]
+                new_regs = [col_regs[ci] for ci in fk_info['parent_indices']]
+                offset += n_fk_cols
+                self.emit(Opcode.FkUpdate, P1=0, P2=0, P3=n_fk_cols,
+                          P4={'fk_info': fk_info, 'td_name': td.name,
+                              'old_regs': old_regs, 'new_regs': new_regs},
+                          comment=f'ON UPDATE {fk_info["action"]}')
 
         if node.returning:
             self.emit(Opcode.SeekRowid, P1=cursor, P2=0, P3=rowid_reg,

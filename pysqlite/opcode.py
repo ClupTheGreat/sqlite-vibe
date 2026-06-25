@@ -289,3 +289,4 @@ class Opcode:
     StrLike = 'StrLike'
     StrGlob = 'StrGlob'
     StrRegexp = 'StrRegexp'
+    FkUpdate = 'FkUpdate'
