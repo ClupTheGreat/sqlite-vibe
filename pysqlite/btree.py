@@ -31,14 +31,6 @@ class BTreePage:
         self.raw_data = bytearray(pager.read_page(page_number))
         self.dirty = False
         self._parse_header()
-        if self.page_type == 0:
-            off = self.b_tree_offset
-            self.raw_data[off + 0] = 0x0D  # PT_LEAF_TABLE
-            self.raw_data[off + 1:off + 3] = (0).to_bytes(2, 'big')  # first_freeblock
-            self.raw_data[off + 3:off + 5] = (0).to_bytes(2, 'big')  # cell_count
-            self.raw_data[off + 5:off + 7] = self.pager.page_size.to_bytes(2, 'big')  # cell_content_offset
-            self.raw_data[off + 7] = 0  # fragmented_free_bytes
-            self._parse_header()
         self._parse_cell_pointers()
 
     @property
@@ -508,7 +500,8 @@ class BTreeCursor:
                         cell = TableLeafCell.parse(cell_data)
                         cell_key = cell.rowid
                     else:
-                        rec, _ = Record.decode(cell_data)
+                        cell = IndexLeafCell.parse(cell_data)
+                        rec, _ = Record.decode(cell.payload)
                         cell_key = rec.get_values()[0]
 
                     if cell_key < key:
@@ -824,6 +817,15 @@ class BTree:
         self.pager = pager
         self.root_page = root_page
         self.is_table = is_table
+        page = BTreePage(self.pager, root_page)
+        if page.page_type == 0:
+            page.page_type = PT_LEAF_TABLE if is_table else PT_LEAF_INDEX
+            page.cell_count = 0
+            page.first_freeblock = 0
+            page.cell_content_offset = pager.page_size
+            page.fragmented_free_bytes = 0
+            page.right_child = 0
+            page.flush()
 
     def cursor(self) -> BTreeCursor:
         return BTreeCursor(self, self.root_page)

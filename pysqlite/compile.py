@@ -659,8 +659,9 @@ class Compiler:
                 td = self._lookup_table_def(table_ref.name, table_ref.schema)
                 self.emit(Opcode.Transaction, P1=0, comment='begin read')
                 self.cursor_table[cursor] = td
+                rd_info = {'without_rowid': True} if td.without_rowid else None
                 self.emit(Opcode.OpenRead, P1=cursor, P2=td.root_page,
-                          P3=len(td.columns), comment=f'open {td.name}')
+                          P3=len(td.columns), P4=rd_info, comment=f'open {td.name}')
                 self.emit(Opcode.Rewind, P1=cursor, P2=len(self.instructions) + 4,
                           comment='rewind')
             elif isinstance(table_ref, SubqueryTable):
@@ -772,8 +773,9 @@ class Compiler:
                 td = self._lookup_table_def(table_ref.name, table_ref.schema)
                 self.emit(Opcode.Transaction, P1=0, comment='begin read')
                 self.cursor_table[cursor] = td
+                rd_info = {'without_rowid': True} if td.without_rowid else None
                 self.emit(Opcode.OpenRead, P1=cursor, P2=td.root_page,
-                          P3=len(td.columns), comment=f'open {td.name}')
+                          P3=len(td.columns), P4=rd_info, comment=f'open {td.name}')
                 self.emit(Opcode.Rewind, P1=cursor, P2=0, comment='rewind')
             elif isinstance(table_ref, SubqueryTable):
                 sub_select = table_ref.select
@@ -1005,13 +1007,22 @@ class Compiler:
         table_info = None
         if td.strict:
             table_info = {'strict': True, 'col_types': [c.type_name.name if c.type_name else 'BLOB' for c in td.columns]}
+        if td.without_rowid:
+            if table_info is None:
+                table_info = {}
+            else:
+                table_info = dict(table_info)
+            table_info['without_rowid'] = True
         self.emit(Opcode.OpenWrite, P1=cursor, P2=td.root_page,
                   P3=len(td.columns), P4=table_info, comment=f'open {td.name}')
 
         if node.default_values:
             rowid_reg = self.alloc_reg()
-            self.emit(Opcode.NewRowid, P1=cursor, P2=0, P3=rowid_reg,
-                      comment='new rowid')
+            if td.without_rowid:
+                self.emit(Opcode.Integer, P1=0, P2=rowid_reg, comment='default key')
+            else:
+                self.emit(Opcode.NewRowid, P1=cursor, P2=0, P3=rowid_reg,
+                          comment='new rowid')
             record_reg = self.alloc_reg()
             self.emit(Opcode.MakeRecord, P1=self.reg_null, P2=1, P3=record_reg,
                       comment='default values record')
@@ -1033,8 +1044,32 @@ class Compiler:
                     vr = self.compile_expr(val, 0)
                     val_regs.append(vr)
                 rowid_reg = self.alloc_reg()
-                # For INTEGER PRIMARY KEY with UPSERT, use PK value as rowid
-                if pk_info:
+                # For WITHOUT ROWID tables, use PK value as key (no NewRowid)
+                if td.without_rowid:
+                    wr_pk = self._get_any_pk_column(td)
+                    if wr_pk is not None:
+                        pk_idx, _ = wr_pk
+                        if node.columns:
+                            mapped = -1
+                            for vi, col_name in enumerate(node.columns):
+                                try:
+                                    ci = td.column_index(col_name)
+                                    if ci == pk_idx:
+                                        mapped = vi
+                                        break
+                                except ValueError:
+                                    pass
+                            pk_val_idx = mapped if mapped >= 0 else pk_idx
+                        else:
+                            pk_val_idx = pk_idx
+                        if pk_val_idx < len(val_regs):
+                            self.emit(Opcode.MemCopy, P1=val_regs[pk_val_idx], P2=rowid_reg,
+                                      comment='PK value as key')
+                        else:
+                            self.emit(Opcode.Integer, P1=0, P2=rowid_reg, comment='default key')
+                    else:
+                        self.emit(Opcode.Integer, P1=0, P2=rowid_reg, comment='default key')
+                elif pk_info:
                     pk_idx, _ = pk_info
                     if node.columns:
                         mapped = -1
@@ -1149,8 +1184,9 @@ class Compiler:
                 src_td = self._lookup_table_def(table_ref.name, table_ref.schema)
                 self.cursor_table[src_cursor] = src_td
                 self.emit(Opcode.Transaction, P1=0, comment='begin read')
+                src_rd_info = {'without_rowid': True} if src_td.without_rowid else None
                 self.emit(Opcode.OpenRead, P1=src_cursor, P2=src_td.root_page,
-                          P3=len(src_td.columns), comment=f'open {src_td.name}')
+                          P3=len(src_td.columns), P4=src_rd_info, comment=f'open {src_td.name}')
                 self.emit(Opcode.Rewind, P1=src_cursor, P2=len(self.instructions) + 4,
                           comment='rewind')
         else:
@@ -1171,7 +1207,19 @@ class Compiler:
                 col_regs.append(r)
 
         rowid_reg = self.alloc_reg()
-        self.emit(Opcode.NewRowid, P1=dest_cursor, P2=0, P3=rowid_reg, comment='new rowid')
+        if td.without_rowid:
+            wr_pk = self._get_any_pk_column(td)
+            if wr_pk is not None:
+                pk_idx, _ = wr_pk
+                if pk_idx < len(col_regs):
+                    self.emit(Opcode.MemCopy, P1=col_regs[pk_idx], P2=rowid_reg,
+                              comment='PK value as key')
+                else:
+                    self.emit(Opcode.Integer, P1=0, P2=rowid_reg, comment='default key')
+            else:
+                self.emit(Opcode.Integer, P1=0, P2=rowid_reg, comment='default key')
+        else:
+            self.emit(Opcode.NewRowid, P1=dest_cursor, P2=0, P3=rowid_reg, comment='new rowid')
         first_val = col_regs[0] if col_regs else self.reg_null
         record_reg = self.alloc_reg()
         self.emit(Opcode.MakeRecord, P1=first_val, P2=len(col_regs),
@@ -1198,8 +1246,9 @@ class Compiler:
                 src_td = self._lookup_table_def(src_ref.name, src_ref.schema)
                 self.cursor_table[src_cursor] = src_td
                 self.emit(Opcode.Transaction, P1=0, comment='begin read')
+                src_rd_info = {'without_rowid': True} if src_td.without_rowid else None
                 self.emit(Opcode.OpenRead, P1=src_cursor, P2=src_td.root_page,
-                          P3=len(src_td.columns), comment=f'open {src_td.name}')
+                          P3=len(src_td.columns), P4=src_rd_info, comment=f'open {src_td.name}')
                 self.emit(Opcode.Rewind, P1=src_cursor, P2=len(self.instructions) + 4,
                           comment='rewind')
             else:
@@ -1258,6 +1307,10 @@ class Compiler:
         table_info = None
         if td.strict:
             table_info = {'strict': True, 'col_types': [c.type_name.name if c.type_name else 'BLOB' for c in td.columns]}
+        if td.without_rowid:
+            if table_info is None:
+                table_info = {}
+            table_info['without_rowid'] = True
         self.emit(Opcode.OpenWrite, P1=cursor, P2=td.root_page,
                   P3=len(td.columns), P4=table_info, comment=f'open {td.name}')
         self.emit(Opcode.Rewind, P1=cursor, P2=0, comment='rewind')
@@ -1388,8 +1441,9 @@ class Compiler:
         cursor = self.alloc_cursor()
         self.cursor_table[cursor] = td
         self.emit(Opcode.Transaction, P1=1, comment='begin write')
+        del_info = {'without_rowid': True} if td.without_rowid else None
         self.emit(Opcode.OpenWrite, P1=cursor, P2=td.root_page,
-                  P3=len(td.columns), comment=f'open {td.name}')
+                  P3=len(td.columns), P4=del_info, comment=f'open {td.name}')
         self.emit(Opcode.Rewind, P1=cursor, P2=0, comment='rewind')
         loop_start = len(self.instructions)
 
@@ -1498,6 +1552,10 @@ class Compiler:
                 col_parts.append(fk_sql)
         parts.append(', '.join(col_parts))
         parts.append(')')
+        if node.without_rowid:
+            parts.append(' WITHOUT ROWID')
+        if node.strict:
+            parts.append(' STRICT')
         return ''.join(parts)
 
     def _compile_create_index(self, node: CreateIndex):
@@ -2093,6 +2151,13 @@ class Compiler:
         from pysqlite.schema import AFFINITY
         for i, col in enumerate(getattr(td, 'columns', [])):
             if col.primary_key and col.affinity == AFFINITY.INTEGER:
+                return i, col
+        return None
+
+    def _get_any_pk_column(self, td: 'TableDef') -> tuple[int, ColumnDef] | None:
+        """Find the first PRIMARY KEY column (any type)."""
+        for i, col in enumerate(getattr(td, 'columns', [])):
+            if col.primary_key:
                 return i, col
         return None
 

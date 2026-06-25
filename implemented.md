@@ -108,7 +108,7 @@
 [x] 7.9 Triggers (BEFORE/AFTER CREATE/DROP via compiled body programs)
 [x] 7.10 UPSERT (ON CONFLICT DO NOTHING/UPDATE + INSERT OR IGNORE)
 [x] 7.11 RETURNING clause (INSERT/UPDATE/DELETE with SeekRowid + ResultRow)
-[ ] 7.12 WITHOUT ROWID tables
+[x] 7.12 WITHOUT ROWID tables
 [x] 7.13 STRICT tables (type enforcement on INSERT)
 [ ] 7.14 Generated columns (VIRTUAL/STORED)
 [ ] 7.15 Full-text search (FTS5)

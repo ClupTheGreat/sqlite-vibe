@@ -22,8 +22,9 @@ def pager():
 class TestBTreePage:
     def test_new_leaf_page(self, pager):
         pn = pager.allocate_page()
+        # BTree now initializes root pages (auto-init moved from BTreePage to BTree)
         page = BTreePage(pager, pn)
-        assert page.page_type == PT_LEAF_TABLE  # auto-initialized from zero-filled
+        assert page.page_type == 0  # zero-filled until BTree initializes it
         assert page.cell_count == 0
         assert page.first_freeblock == 0
 

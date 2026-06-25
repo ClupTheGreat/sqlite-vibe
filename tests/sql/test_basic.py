@@ -645,3 +645,52 @@ class TestTransactions:
         db.execute('ROLLBACK')
         res = db.execute('SELECT * FROM t')
         assert res == []
+
+
+class TestWithoutRowid:
+    def test_create_without_rowid(self, db):
+        res = db.execute('CREATE TABLE t (a INT PRIMARY KEY, b TEXT) WITHOUT ROWID')
+        assert res == []
+
+    def test_insert_and_select(self, db):
+        db.execute('CREATE TABLE t (a INT PRIMARY KEY, b TEXT) WITHOUT ROWID')
+        db.execute("INSERT INTO t VALUES (1, 'one')")
+        db.execute("INSERT INTO t VALUES (2, 'two')")
+        res = db.execute('SELECT * FROM t ORDER BY a')
+        assert res == [[1, 'one'], [2, 'two']]
+
+    def test_insert_duplicate_pk(self, db):
+        db.execute('CREATE TABLE t (a INT PRIMARY KEY, b TEXT) WITHOUT ROWID')
+        db.execute("INSERT INTO t VALUES (1, 'one')")
+        with pytest.raises(Exception, match='Constraint|UNIQUE|PRIMARY|duplicate'):
+            db.execute("INSERT INTO t VALUES (1, 'two')")
+
+    def test_select_where(self, db):
+        db.execute('CREATE TABLE t (a INT PRIMARY KEY, b TEXT) WITHOUT ROWID')
+        db.execute("INSERT INTO t VALUES (1, 'one')")
+        db.execute("INSERT INTO t VALUES (2, 'two')")
+        res = db.execute("SELECT b FROM t WHERE a = 2")
+        assert res == [['two']]
+
+    def test_update_row(self, db):
+        db.execute('CREATE TABLE t (a INT PRIMARY KEY, b TEXT) WITHOUT ROWID')
+        db.execute("INSERT INTO t VALUES (1, 'one')")
+        db.execute("INSERT INTO t VALUES (2, 'two')")
+        db.execute("UPDATE t SET b = 'updated' WHERE a = 1")
+        res = db.execute('SELECT b FROM t ORDER BY a')
+        assert res == [['updated'], ['two']]
+
+    def test_delete_row(self, db):
+        db.execute('CREATE TABLE t (a INT PRIMARY KEY, b TEXT) WITHOUT ROWID')
+        db.execute("INSERT INTO t VALUES (1, 'one')")
+        db.execute("INSERT INTO t VALUES (2, 'two')")
+        db.execute("DELETE FROM t WHERE a = 1")
+        res = db.execute('SELECT * FROM t ORDER BY a')
+        assert res == [[2, 'two']]
+
+    def test_text_pk(self, db):
+        db.execute('CREATE TABLE t (a TEXT PRIMARY KEY, b INT) WITHOUT ROWID')
+        db.execute("INSERT INTO t VALUES ('key1', 10)")
+        db.execute("INSERT INTO t VALUES ('key2', 20)")
+        res = db.execute('SELECT * FROM t ORDER BY a')
+        assert res == [['key1', 10], ['key2', 20]]

@@ -55,6 +55,7 @@ class Cursor:
     row: list[Register] | None = None
     strict: bool = False
     col_types: list[str] | None = None  # for STRICT validation
+    without_rowid: bool = False
 
     @property
     def root_page(self) -> int:
@@ -262,18 +263,20 @@ class VM:
     # ── Cursor Operations ──
 
     def _op_OpenRead(self, P1: int, P2: int, P3: int, P4: Any, P5: int):
-        btree = BTree(self.pager, P2, is_table=True)
+        without_rowid = isinstance(P4, dict) and P4.get('without_rowid', False)
+        btree = BTree(self.pager, P2, is_table=not without_rowid)
         cursor = btree.cursor()
-        c = Cursor(btree=btree, cursor=cursor)
+        c = Cursor(btree=btree, cursor=cursor, without_rowid=without_rowid)
         if isinstance(P4, dict):
             c.strict = P4.get('strict', False)
             c.col_types = P4.get('col_types')
         self.cursors[P1] = c
 
     def _op_OpenWrite(self, P1: int, P2: int, P3: int, P4: Any, P5: int):
-        btree = BTree(self.pager, P2, is_table=True)
+        without_rowid = isinstance(P4, dict) and P4.get('without_rowid', False)
+        btree = BTree(self.pager, P2, is_table=not without_rowid)
         cursor = btree.cursor()
-        c = Cursor(btree=btree, cursor=cursor, is_writable=True)
+        c = Cursor(btree=btree, cursor=cursor, is_writable=True, without_rowid=without_rowid)
         if isinstance(P4, dict):
             c.strict = P4.get('strict', False)
             c.col_types = P4.get('col_types')
@@ -725,9 +728,16 @@ class VM:
                         self.error = f'STRICT table: expected REAL for column {i}, got {type(val).__name__}'
                         return
         rowid = self._reg(P3).value if P3 in self.registers else 0
-        if not isinstance(rowid, int):
-            rowid = 0
-        key = rowid
+        if c.without_rowid:
+            key = rowid
+            # Check for duplicate PK
+            if c.cursor.seek(key):
+                self.error = 'UNIQUE constraint failed: duplicate primary key'
+                return
+        else:
+            if not isinstance(rowid, int):
+                rowid = 0
+            key = rowid
         c.cursor.insert(key, rowid, payload)
         self.changes += 1
         self.last_rowid = rowid
