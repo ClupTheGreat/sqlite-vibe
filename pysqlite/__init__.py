@@ -7,6 +7,13 @@ class DatabaseError(Exception):
     pass
 
 
+class QueryResult(list):
+    """Result of a SQL query. Behaves like list[list] but also has .columns."""
+    def __init__(self, rows=(), columns=None):
+        super().__init__(rows)
+        self.columns = list(columns) if columns else []
+
+
 class Database:
     """End-to-end database interface: SQL in, results out."""
 
@@ -37,9 +44,10 @@ class Database:
         for stmt in statements:
             compiler = Compiler(self.schema, self.pager)
             program = compiler.compile(stmt)
+            columns = compiler.result_columns
             vm = VM(self.pager, self.tx)
             rows = vm.run(program)
-            results.append(rows)
+            results.append(QueryResult(rows, columns=columns))
 
         return results if len(results) != 1 else results[0]
 

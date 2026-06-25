@@ -133,6 +133,7 @@ class Compiler:
         self.reg_one = self.alloc_reg()
         self.reg_null = self.alloc_reg()
         self.cursor_table: dict[int, TableDef] = {}
+        self.result_columns: list[str] = []
         self.emit(Opcode.Integer, P1=0, P2=self.reg_zero, comment='const 0')
         self.emit(Opcode.Integer, P1=1, P2=self.reg_one, comment='const 1')
         self.emit(Opcode.Null, P1=self.reg_null, comment='const null')
@@ -536,10 +537,12 @@ class Compiler:
         # Result columns
         self._current_select_columns = node.columns
         col_regs = []
+        self.result_columns = []
         for rc in node.columns:
             if isinstance(rc.expr, StarExpr):
                 td = self._lookup_table(cursor)
                 for i in range(len(getattr(td, 'columns', []))):
+                    self.result_columns.append(getattr(td.columns[i], 'name', f'col{i}') if hasattr(td, 'columns') and i < len(td.columns) else f'col{i}')
                     r = self.alloc_reg()
                     col_regs.append(r)
                     self.emit(Opcode.Column, P1=cursor, P2=i, P3=r,
@@ -547,6 +550,12 @@ class Compiler:
             else:
                 r = self.compile_expr(rc.expr, cursor)
                 col_regs.append(r)
+                if rc.alias:
+                    self.result_columns.append(rc.alias)
+                elif isinstance(rc.expr, ColumnRef):
+                    self.result_columns.append(rc.expr.name)
+                else:
+                    self.result_columns.append(f'col{len(self.result_columns)}')
 
         if col_regs:
             first_reg = min(col_regs)
@@ -636,6 +645,7 @@ class Compiler:
             'aggs': [],
         }
         col_regs = []
+        self.result_columns = []
 
         for rc in node.columns:
             if self._is_aggregate(rc.expr):
@@ -660,6 +670,12 @@ class Compiler:
             else:
                 r = self.compile_expr(rc.expr, cursor)
                 col_regs.append(r)
+                if rc.alias:
+                    self.result_columns.append(rc.alias)
+                elif isinstance(rc.expr, ColumnRef):
+                    self.result_columns.append(rc.expr.name)
+                else:
+                    self.result_columns.append(f'col{len(self.result_columns)}')
 
         hidden_cols = []
         for gb_expr in node.group_by:
