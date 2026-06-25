@@ -1200,6 +1200,10 @@ class Parser:
         if tt == TokenType.RAISE:
             return self._parse_raise()
 
+        if tt == TokenType.PARAM:
+            from pysqlite.ast import Parameter
+            return Parameter(name=self.advance().value)
+
         if tt in (TokenType.INTEGER, TokenType.FLOAT, TokenType.STRING,
                    TokenType.BLOB, TokenType.NULL):
             return self._parse_literal()

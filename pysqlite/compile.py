@@ -20,7 +20,7 @@ from pysqlite.ast import (
     ResultColumn, OrderingTerm, SetClause, Returning, CTE,
     TableName, TableFunction, SubqueryTable, JoinClause,
     ColumnDef as AstColumnDef, ColumnConstraint, TableConstraint, TypeName,
-    WindowDef, WindowFrame, OnConflict,
+    WindowDef, WindowFrame, OnConflict, Parameter,
 )
 
 
@@ -134,6 +134,7 @@ class Compiler:
         self.reg_null = self.alloc_reg()
         self.cursor_table: dict[int, TableDef] = {}
         self.result_columns: list[str] = []
+        self._param_counter = 0
         self.emit(Opcode.Integer, P1=0, P2=self.reg_zero, comment='const 0')
         self.emit(Opcode.Integer, P1=1, P2=self.reg_one, comment='const 1')
         self.emit(Opcode.Null, P1=self.reg_null, comment='const null')
@@ -241,6 +242,14 @@ class Compiler:
 
         elif isinstance(expr, NullLiteral):
             self.emit(Opcode.Null, P1=reg, comment='NULL')
+
+        elif isinstance(expr, Parameter):
+            pname = expr.name
+            if pname == '?':
+                self._param_counter += 1
+                pname = f'?{self._param_counter}'
+            self.emit(Opcode.Param, P4=pname, P2=reg,
+                      comment=f'param {pname}')
 
         elif isinstance(expr, ColumnRef):
             table_def = self._lookup_table(cursor)

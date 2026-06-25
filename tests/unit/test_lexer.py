@@ -139,7 +139,7 @@ def test_keywords():
 
 def test_unexpected_character():
     with pytest.raises(LexerError):
-        tokenize("SELECT @foo")
+        tokenize("SELECT #foo")
 
 
 def test_positions():

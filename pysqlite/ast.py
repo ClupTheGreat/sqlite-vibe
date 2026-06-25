@@ -215,6 +215,11 @@ class TableFunction:
 
 
 @dataclass
+class Parameter(Expr):
+    name: str  # '?', '?1', ':name', '@name', '$name'
+
+
+@dataclass
 class SubqueryTable:
     select: 'Select'
     alias: str | None = None

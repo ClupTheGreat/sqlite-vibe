@@ -30,6 +30,9 @@ class Database:
         self.tx = TransactionManager(self.pager, self.vfs, self.pager.handle)
 
     def execute(self, sql: str):
+        return self.execute_params(sql)
+
+    def execute_params(self, sql: str, params: dict | None = None):
         from pysqlite.lexer import Lexer
         from pysqlite.parser import Parser
         from pysqlite.compile import Compiler
@@ -46,7 +49,7 @@ class Database:
             program = compiler.compile(stmt)
             columns = compiler.result_columns
             vm = VM(self.pager, self.tx)
-            rows = vm.run(program)
+            rows = vm.run(program, params=params)
             results.append(QueryResult(rows, columns=columns))
 
         return results if len(results) != 1 else results[0]

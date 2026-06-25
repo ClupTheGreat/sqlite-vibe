@@ -561,6 +561,38 @@ class TestUpsert:
         assert res == [[1, 'hello'], [2, 'world'], [3, 'new']]
 
 
+class TestParameterBinding:
+    def test_named_param(self, db):
+        db.execute('CREATE TABLE t (a INT, b TEXT)')
+        db.execute_params("INSERT INTO t VALUES (:a, :b)", {"a": 1, "b": "hello"})
+        res = db.execute_params("SELECT * FROM t WHERE a = :a", {"a": 1})
+        assert res == [[1, 'hello']]
+
+    def test_positional_param(self, db):
+        db.execute('CREATE TABLE t (a INT, b TEXT)')
+        db.execute_params("INSERT INTO t VALUES (?1, ?2)", {"1": 1, "2": "hello"})
+        res = db.execute_params("SELECT * FROM t WHERE a = ?", {"1": 1})
+        assert res == [[1, 'hello']]
+
+    def test_auto_indexed_param(self, db):
+        db.execute('CREATE TABLE t (a INT, b TEXT)')
+        db.execute_params("INSERT INTO t VALUES (?, ?)", {"1": 1, "2": "hello"})
+        res = db.execute_params("SELECT * FROM t WHERE a = ? AND b = ?", {"1": 1, "2": "hello"})
+        assert res == [[1, 'hello']]
+
+    def test_at_param(self, db):
+        db.execute('CREATE TABLE t (a INT)')
+        db.execute_params("INSERT INTO t VALUES (@a)", {"a": 42})
+        res = db.execute_params("SELECT * FROM t WHERE a = @a", {"a": 42})
+        assert res == [[42]]
+
+    def test_dollar_param(self, db):
+        db.execute('CREATE TABLE t (a INT)')
+        db.execute_params("INSERT INTO t VALUES ($a)", {"a": 99})
+        res = db.execute_params("SELECT * FROM t WHERE a = $a", {"a": 99})
+        assert res == [[99]]
+
+
 class TestTransactions:
     def test_begin_commit(self, db):
         db.execute('CREATE TABLE t (a INT)')

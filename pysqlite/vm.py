@@ -87,7 +87,7 @@ class VM:
             from pysqlite.transaction import TransactionManager
             self.tx = TransactionManager(self.pager, self.pager.vfs, self.pager.handle)
 
-    def run(self, program: list[Instruction]) -> list[list]:
+    def run(self, program: list[Instruction], params: dict | None = None) -> list[list]:
         self.program = program
         self.pc = 0
         self.registers = {}
@@ -103,6 +103,7 @@ class VM:
         self._current_row = []
         self.sort_spec = []
         self.agg_spec = None
+        self.params: dict = params or {}
 
         if self.pager is None:
             self.error = 'No pager available'
@@ -478,6 +479,24 @@ class VM:
 
     def _op_Null(self, P1: int, P2: int, P3: int, P4: Any, P5: int):
         self._set_reg(P1, Register())
+
+    def _op_Param(self, P1: int, P2: int, P3: int, P4: Any, P5: int):
+        name = str(P4) if P4 is not None else ''
+        if name in self.params:
+            val = self.params[name]
+        elif name.lstrip('?:@$') in self.params:
+            val = self.params[name.lstrip('?:@$')]
+        else:
+            try:
+                idx = int(name.lstrip('?'))
+                key = str(idx)
+                if key in self.params:
+                    val = self.params[key]
+                else:
+                    val = None
+            except (ValueError, IndexError):
+                val = None
+        self._set_reg(P2, make_register(val))
 
     def _op_MemNull(self, P1: int, P2: int, P3: int, P4: Any, P5: int):
         self._set_reg(P1, Register())

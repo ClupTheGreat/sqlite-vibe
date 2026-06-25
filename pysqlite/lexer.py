@@ -55,7 +55,7 @@ class TokenType(Enum):
     LSHIFT = auto(); RSHIFT = auto(); ARROW = auto(); ARROW2 = auto()
     # Punctuation
     LPAREN = auto(); RPAREN = auto(); LBRACKET = auto(); RBRACKET = auto()
-    DOT = auto(); COMMA = auto(); SEMI = auto()
+    DOT = auto(); COMMA = auto(); SEMI = auto(); PARAM = auto()
     # Special
     EOF = auto()
 
@@ -227,6 +227,10 @@ class Lexer:
                 self._read_quoted_id()
                 continue
 
+            if ch in '?:@$':
+                self._read_param(start)
+                continue
+
             if ch == 'x' or ch == 'X':
                 if self._peek() == "'":
                     self._read_blob(start)
@@ -325,6 +329,17 @@ class Lexer:
                 else:
                     break
         self._emit(TokenType.STRING, self.sql[start:self.pos], start)
+
+    def _read_param(self, start: int):
+        self._advance()
+        if self.pos < len(self.sql) and self.sql[self.pos].isdigit():
+            while self.pos < len(self.sql) and self.sql[self.pos].isdigit():
+                self._advance()
+        elif self.pos < len(self.sql) and (self.sql[self.pos].isalnum() or self.sql[self.pos] == '_'):
+            self._advance()
+            while self.pos < len(self.sql) and (self.sql[self.pos].isalnum() or self.sql[self.pos] == '_'):
+                self._advance()
+        self._emit(TokenType.PARAM, self.sql[start:self.pos], start)
 
     def _read_quoted_id(self):
         start = self.pos
