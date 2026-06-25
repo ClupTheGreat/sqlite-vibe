@@ -1306,6 +1306,158 @@ class VM:
         if isinstance(P4, list):
             self.sort_spec = (P1, P4)  # (n_visible, [(col_idx, descending), ...])
 
+    def _op_WindowFunction(self, P1: int, P2: int, P3: int, P4: Any, P5: int):
+        if not isinstance(P4, dict):
+            return
+        c = self.cursors.get(P1)
+        if c is None:
+            return
+        win_info = P4
+        n_result_cols = win_info.get('n_result_cols', 0)
+        n_sort_keys = win_info.get('n_sort_keys', 0)
+        n_total_cols = win_info.get('n_total_cols', 0)
+        windows = win_info.get('windows', [])
+        if not windows:
+            return
+
+        # Read all rows from cursor
+        rows = []
+        c.cursor.first()
+        while not c.cursor.eof:
+            payload = c.cursor.current_payload()
+            rec, _ = Record.decode(payload)
+            vals = rec.get_values()
+            if len(vals) >= n_total_cols:
+                result_col = vals[:n_result_cols]
+                sort_key = vals[n_result_cols:n_result_cols + n_sort_keys]
+                rows.append((sort_key, result_col))
+            c.cursor.next()
+
+        if not rows:
+            return
+
+        # Sort rows by sort_key (partition keys then order keys)
+        n_part_keys = 0
+        n_order_keys = 0
+        if windows:
+            n_part_keys = len(windows[0].get('partition', []))
+
+        # Multi-pass stable sort for each ORDER BY column in reverse order
+        if windows and windows[0].get('order'):
+            order = windows[0].get('order', [])
+            for j in range(len(order) - 1, -1, -1):
+                col_idx = n_part_keys + j
+                desc = order[j].get('dir', 'ASC') == 'DESC'
+                rows.sort(key=lambda item, ci=col_idx: self._reg_val_for_sort(item[0][ci]),
+                          reverse=desc)
+
+        # Partition by partition keys (group consecutive sorted rows with same part key)
+
+        partitions = []
+        current_part = None
+        current_group = None
+        for sort_key, result_col in rows:
+            part_key = tuple(sort_key[:n_part_keys]) if n_part_keys > 0 else ()
+            if part_key != current_part:
+                current_part = part_key
+                current_group = []
+                partitions.append(current_group)
+            current_group.append((sort_key, result_col))
+
+        # Compute window functions for each partition and emit result rows
+        for group in partitions:
+            n = len(group)
+            wf_names = [w['name'] for w in windows]
+            win_results = []
+            for w in windows:
+                name = w['name']
+                is_agg = w.get('is_aggregate', False)
+                order = w.get('order', [])
+                frame = w.get('frame', {})
+                unit = frame.get('unit', 'RANGE')
+                fstart = frame.get('start', 'UNBOUNDED PRECEDING')
+                fend = frame.get('end', 'CURRENT ROW')
+
+                if name == 'ROW_NUMBER':
+                    win_results.append(list(range(1, n + 1)))
+                elif name == 'RANK':
+                    ranks = []
+                    current_rank = 1
+                    for i in range(n):
+                        if i > 0 and order:
+                            prev_key = tuple(group[i - 1][0][n_part_keys:])
+                            cur_key = tuple(group[i][0][n_part_keys:])
+                            if cur_key != prev_key:
+                                current_rank = i + 1
+                        ranks.append(current_rank)
+                    win_results.append(ranks)
+                elif name == 'DENSE_RANK':
+                    ranks = []
+                    current_rank = 1
+                    for i in range(n):
+                        if i > 0 and order:
+                            prev_key = tuple(group[i - 1][0][n_part_keys:])
+                            cur_key = tuple(group[i][0][n_part_keys:])
+                            if cur_key != prev_key:
+                                current_rank += 1
+                        ranks.append(current_rank)
+                    win_results.append(ranks)
+                elif is_agg:
+                    agg_results = []
+                    for i in range(n):
+                        lo, hi = self._window_frame_bounds(i, n, unit, fstart, fend)
+                        frame_rows = [group[j][1] for j in range(lo, hi)]
+                        arg_idx = w.get('col_idx', 0)
+                        vals = [r[arg_idx] if len(r) > arg_idx else None for r in frame_rows]
+                        result_val = self._compute_aggregate(name, vals, False)
+                        agg_results.append(result_val)
+                    win_results.append(agg_results)
+                else:
+                    win_results.append([None] * n)
+
+            # Emit result rows: override window function positions with computed values
+            for i, (sort_key, result_col) in enumerate(group):
+                out_row = list(result_col)
+                for wi, w in enumerate(windows):
+                    col_idx = w.get('col_idx', wi)
+                    if i < len(win_results[wi]):
+                        out_row[col_idx] = win_results[wi][i]
+                self.result_rows.append(out_row)
+
+    @staticmethod
+    def _reg_val_for_sort(v: Any):
+        if v is None:
+            return (1,)
+        if isinstance(v, (int, float)):
+            return (0, v)
+        if isinstance(v, str):
+            return (0, v)
+        if isinstance(v, bytes):
+            return (0, v)
+        return (0, str(v))
+
+    def _window_frame_bounds(self, i: int, n: int, unit: str,
+                               start: str, end: str) -> tuple[int, int]:
+        lo = 0
+        hi = n
+        if start == 'UNBOUNDED PRECEDING':
+            lo = 0
+        elif start == 'CURRENT ROW':
+            lo = i
+        elif start.startswith('PRECEDING'):
+            lo = max(0, i - 1)
+        elif start.startswith('FOLLOWING'):
+            lo = i
+        if end == 'UNBOUNDED FOLLOWING':
+            hi = n
+        elif end == 'CURRENT ROW':
+            hi = i + 1
+        elif end.startswith('PRECEDING'):
+            hi = i
+        elif end.startswith('FOLLOWING'):
+            hi = min(n, i + 2)
+        return (lo, hi)
+
     def _op_Aggregate(self, P1: int, P2: int, P3: int, P4: Any, P5: int):
         if isinstance(P4, dict):
             self.agg_spec = P4

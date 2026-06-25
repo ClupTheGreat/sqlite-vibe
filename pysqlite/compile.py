@@ -216,6 +216,12 @@ class Compiler:
                 return True
         return False
 
+    def _has_window_functions(self, node: Select) -> bool:
+        for rc in node.columns:
+            if isinstance(rc.expr, FunctionCall) and rc.expr.over is not None:
+                return True
+        return False
+
     def _serialize_having(self, expr: Expr, aggs: list[dict]) -> Any:
         if isinstance(expr, Literal):
             return ('literal', expr.value)
@@ -308,6 +314,12 @@ class Compiler:
 
         elif isinstance(expr, FunctionCall):
             func = expr.name.upper()
+            # Window function — defer evaluation to WindowFunction opcode
+            if expr.over is not None:
+                # Args NOT compiled here — _compile_window handles them
+                # to avoid register gaps in MakeRecord
+                self.emit(Opcode.Null, P1=reg, comment='window placeholder')
+                return
             arg_regs = [self.compile_expr(a, cursor) for a in expr.args]
             first_reg = arg_regs[0] if arg_regs else 0
             n_args = len(arg_regs)
@@ -517,8 +529,13 @@ class Compiler:
         cursor = self.alloc_cursor()
 
         # If aggregates or GROUP BY, use aggregation compiler
-        if self._has_aggregates(node):
+        if self._has_aggregates(node) and not self._has_window_functions(node):
             self._compile_aggregation(node, cursor)
+            return
+
+        # If window functions, use window compiler
+        if self._has_window_functions(node):
+            self._compile_window(node, cursor)
             return
 
         # Determine table/root page
@@ -746,6 +763,212 @@ class Compiler:
 
         if node.from_clause:
             self.emit(Opcode.Next, P1=cursor, P2=loop_start, comment='next row')
+
+    def _compile_window(self, node: Select, cursor: int):
+        self._expand_views(node)
+        if node.from_clause:
+            table_ref = node.from_clause[0]
+            if isinstance(table_ref, TableName):
+                td = self._lookup_table_def(table_ref.name, table_ref.schema)
+                self.emit(Opcode.Transaction, P1=0, comment='begin read')
+                self.cursor_table[cursor] = td
+                self.emit(Opcode.OpenRead, P1=cursor, P2=td.root_page,
+                          P3=len(td.columns), comment=f'open {td.name}')
+                self.emit(Opcode.Rewind, P1=cursor, P2=0, comment='rewind')
+            elif isinstance(table_ref, SubqueryTable):
+                sub_select = table_ref.select
+                from pysqlite.schema import AFFINITY
+                sub_cols = []
+                for rc in sub_select.columns:
+                    if rc.alias:
+                        cname = rc.alias
+                    elif isinstance(rc.expr, ColumnRef):
+                        cname = rc.expr.name
+                    else:
+                        cname = f'col_{len(sub_cols)}'
+                    sub_cols.append(ColumnDef(name=cname, affinity=AFFINITY.BLOB))
+                td = TableDef(name=table_ref.alias or '_sub', columns=sub_cols, root_page=0, sql='')
+                self.cursor_table[cursor] = td
+                self.emit(Opcode.OpenEphemeral, P1=cursor, P2=1,
+                          comment='subquery')
+                self._compile_subquery_fill(sub_select, cursor, sub_cols)
+                self.emit(Opcode.Rewind, P1=cursor, P2=0, comment='rewind subquery')
+            else:
+                self.emit(Opcode.OpenEphemeral, P1=cursor, P2=1, comment='table ref')
+        else:
+            self.emit(Opcode.OpenEphemeral, P1=cursor, P2=1, comment='dummy')
+
+        wcursor = self.alloc_cursor()
+        self.emit(Opcode.OpenEphemeral, P1=wcursor, P2=3,
+                  comment='window sorter')
+
+        loop_start = len(self.instructions)
+        where_skip = None
+        if node.where:
+            where_reg = self.compile_expr(node.where, cursor)
+            where_skip = self._label_name('win_where_skip')
+            self.emit_ifnot(where_reg, where_skip)
+
+        sort_key_regs = []
+        part_regs = []
+        order_regs = []
+
+        # Collect partition by and order by from all window functions
+        all_partitions: list[list[Expr]] = []
+        all_orders: list[list[OrderingTerm]] = []
+        for rc in node.columns:
+            if isinstance(rc.expr, FunctionCall) and rc.expr.over is not None:
+                wd = rc.expr.over
+                if wd.name:
+                    from pysqlite.ast import WindowDef
+                    for wn, wdef in getattr(node, 'window', []):
+                        if wn == wd.name:
+                            wd = wdef
+                            break
+                if wd.partition:
+                    all_partitions.append(wd.partition)
+                if wd.order:
+                    all_orders.append(wd.order)
+
+        # Use first window's partition by and order by as sort keys
+        sort_partition = all_partitions[0] if all_partitions else []
+        sort_order = all_orders[0] if all_orders else []
+
+        sort_key_start = None
+
+        # Result columns first (so they use registers 0, 1, ...)
+        col_regs = []
+        self.result_columns = []
+        for rc in node.columns:
+            if isinstance(rc.expr, FunctionCall) and rc.expr.over is not None and rc.expr.args:
+                # For window functions, compile first arg so its value goes into the record
+                r = self.compile_expr(rc.expr.args[0], cursor)
+            else:
+                r = self.compile_expr(rc.expr, cursor)
+            col_regs.append(r)
+            if rc.alias:
+                self.result_columns.append(rc.alias)
+            elif isinstance(rc.expr, ColumnRef):
+                self.result_columns.append(rc.expr.name)
+            elif isinstance(rc.expr, FunctionCall):
+                self.result_columns.append(rc.expr.name)
+            else:
+                self.result_columns.append(f'col{len(self.result_columns)}')
+
+        # Sort keys after result columns
+        for pe in sort_partition:
+            r = self.compile_expr(pe, cursor)
+            part_regs.append(r)
+
+        for oe in sort_order:
+            r = self.compile_expr(oe.expr, cursor)
+            order_regs.append(r)
+
+        all_sort_keys = list(part_regs) + list(order_regs)
+        sort_key_start = len(col_regs)
+        col_regs.extend(all_sort_keys)
+
+        # Insert into sorter
+        record_reg = self.alloc_reg()
+        self.emit(Opcode.MakeRecord, P1=min(col_regs) if col_regs else 0,
+                  P2=len(col_regs), P3=record_reg,
+                  comment='make window record')
+        rowid_reg = self.alloc_reg()
+        self.emit(Opcode.Sequence, P1=wcursor, P2=rowid_reg,
+                  comment='assign rowid')
+        self.emit(Opcode.Insert, P1=wcursor, P2=record_reg, P3=rowid_reg,
+                  comment='insert into window sorter')
+
+        if where_skip:
+            self.define_label(where_skip)
+        if node.from_clause:
+            self.emit(Opcode.Next, P1=cursor, P2=loop_start,
+                      comment='next source row')
+
+        # Sort the window table
+        sort_cols = len(all_sort_keys)
+        self.emit(Opcode.Sort, P1=wcursor, P2=sort_cols,
+                  comment='sort window')
+
+        # Rewind sorted table
+        self.emit(Opcode.Rewind, P1=wcursor, P2=0, comment='rewind sorted')
+
+        # Window function evaluation
+        win_info = self._collect_window_info(node)
+        win_info['n_result_cols'] = len(node.columns)
+        win_info['n_sort_keys'] = sort_cols
+        win_info['n_total_cols'] = len(col_regs)
+        self.result_columns = [rc.alias if rc.alias else (
+            rc.expr.name if isinstance(rc.expr, ColumnRef) else
+            rc.expr.name.upper() if isinstance(rc.expr, FunctionCall) else
+            f'col{i}') for i, rc in enumerate(node.columns)]
+        self.emit(Opcode.WindowFunction, P1=wcursor, P4=win_info,
+                  comment='window function')
+
+        # Handle ORDER BY via post-processing sort
+        if node.order_by:
+            n_visible = len(node.columns)
+            terms = node.order_by
+            sort_cols_list = []
+            for term in terms:
+                col_idx = None
+                if isinstance(term.expr, Literal) and isinstance(term.expr.value, int):
+                    col_idx = term.expr.value - 1
+                elif isinstance(term.expr, ColumnRef):
+                    for i, rc in enumerate(node.columns):
+                        if isinstance(rc.expr, ColumnRef) and rc.expr.name == term.expr.name:
+                            col_idx = i
+                            break
+                if col_idx is not None:
+                    sort_cols_list.append((col_idx, term.direction == 'DESC'))
+            self.emit(Opcode.Sort, P1=n_visible, P2=0, P4=sort_cols_list,
+                      comment='ORDER BY after window')
+        # WindowFunction handler appends directly to self.result_rows
+
+    def _collect_window_info(self, node: Select) -> dict:
+        all_aggs = AGGREGATE_FUNCTIONS | self.custom_aggregates
+        win_info = {
+            'windows': [],
+        }
+        for col_idx, rc in enumerate(node.columns):
+            if isinstance(rc.expr, FunctionCall) and rc.expr.over is not None:
+                fc = rc.expr
+                wd = fc.over
+                if wd.name:
+                    from pysqlite.ast import WindowDef
+                    for wn, wdef in getattr(node, 'window', []):
+                        if wn == wd.name:
+                            wd = wdef
+                            break
+                has_order = bool(wd.order)
+                win_info['windows'].append({
+                    'col_idx': col_idx,
+                    'name': fc.name.upper(),
+                    'is_aggregate': fc.name.upper() in all_aggs,
+                    'partition': [self._serialize_expr(e) for e in wd.partition],
+                    'order': [{'expr': self._serialize_expr(o.expr),
+                               'dir': o.direction or 'ASC'}
+                              for o in wd.order],
+                    'frame': {
+                        'unit': wd.frame.unit if wd.frame else 'RANGE',
+                        'start': wd.frame.start if wd.frame else 'UNBOUNDED PRECEDING',
+                        'end': wd.frame.end if wd.frame else ('CURRENT ROW' if has_order else 'UNBOUNDED FOLLOWING'),
+                    } if wd.frame else {'unit': 'RANGE', 'start': 'UNBOUNDED PRECEDING', 'end': 'CURRENT ROW' if has_order else 'UNBOUNDED FOLLOWING'},
+                })
+        return win_info
+
+    def _serialize_expr(self, expr: Expr) -> Any:
+        if isinstance(expr, Literal):
+            return ('literal', expr.value)
+        if isinstance(expr, NullLiteral):
+            return ('literal', None)
+        if isinstance(expr, ColumnRef):
+            return ('column', expr.name)
+        if isinstance(expr, BinaryOp):
+            return (expr.op, self._serialize_expr(expr.left), self._serialize_expr(expr.right))
+        if isinstance(expr, UnaryOp):
+            return (expr.op, self._serialize_expr(expr.operand))
+        return ('literal', None)
 
     def _compile_compound(self, node: Select):
         ep = self.alloc_cursor()

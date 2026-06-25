@@ -103,7 +103,7 @@
 [x] 7.4 Math functions (ACOS, SIN, COS, LOG, SQRT, PI, POWER, RAND, etc.)
 [x] 7.5 Date/time functions (DATE, TIME, DATETIME, JULIANDAY, STRFTIME, UNIXEPOCH)
 [x] 7.6 JSON functions (json, json_valid, json_type, json_array_length, json_extract, json_array, json_object, json_set, json_insert, json_replace, json_remove, json_group_array, json_group_object)
-[ ] 7.7 Window functions (ROW_NUMBER, RANK, LAG, LEAD, NTILE, etc.)
+[x] 7.7 Window functions (ROW_NUMBER, RANK, DENSE_RANK, aggregate-over-window: SUM, COUNT, AVG, MIN, MAX; PARTITION BY, ORDER BY ASC/DESC)
 [x] 7.8 Views (CREATE/DROP, expansion with column rewriting)
 [x] 7.9 Triggers (BEFORE/AFTER CREATE/DROP via compiled body programs)
 [x] 7.10 UPSERT (ON CONFLICT DO NOTHING/UPDATE + INSERT OR IGNORE)
