@@ -110,6 +110,8 @@ class TriggerDef:
     sql: str
     time: str = 'BEFORE'
     event: str = 'INSERT'
+    programs: list = field(default_factory=list)
+    parsed_ast: Any = None
 
 
 # ── Collation ──
@@ -365,7 +367,34 @@ class Schema:
         )
 
     def _parse_create_trigger(self, name: str, tbl_name: str, sql: str) -> TriggerDef:
-        return TriggerDef(name=name, table_name=tbl_name, sql=sql)
+        try:
+            tokens = Lexer(sql).tokenize()
+            parser = Parser(tokens)
+            stmts = parser.parse()
+        except Exception:
+            return TriggerDef(name=name, table_name=tbl_name, sql=sql)
+
+        stmt = None
+        for s in stmts:
+            if isinstance(s, CreateTrigger):
+                stmt = s
+                break
+        if stmt is None:
+            return TriggerDef(name=name, table_name=tbl_name, sql=sql)
+
+        stmt.name = name
+        from pysqlite.compile import Compiler
+        programs = []
+        for body_stmt in stmt.statements:
+            compiler = Compiler(self, self.pager)
+            prog = compiler.compile(body_stmt)
+            programs.append(prog)
+
+        return TriggerDef(
+            name=name, table_name=tbl_name, sql=sql,
+            time=stmt.time, event=stmt.event,
+            programs=programs, parsed_ast=stmt,
+        )
 
     def _extract_select(self, sql: str) -> Select | None:
         try:

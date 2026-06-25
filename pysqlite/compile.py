@@ -4,13 +4,13 @@ from typing import Any
 
 from pysqlite.opcode import Instruction, Opcode
 from pysqlite.schema import (
-    TableDef, ColumnDef, IndexDef, IndexedColumnDef, AFFINITY,
+    TableDef, ColumnDef, IndexDef, IndexedColumnDef, TriggerDef, AFFINITY,
 )
 from pysqlite.ast import (
     Statement, Expr,
     Select, Insert, Update, Delete,
     CreateTable, CreateIndex, DropTable, DropIndex,
-    CreateView, DropView, CreateTrigger, AlterTable,
+    CreateView, DropView, CreateTrigger, DropTrigger, AlterTable,
     Begin, Commit, RollbackStmt, Savepoint, Release,
     Pragma, Explain, Analyze,
     Literal, NullLiteral, ColumnRef, UnaryOp, BinaryOp,
@@ -173,6 +173,10 @@ class Compiler:
             self._compile_create_view(statement)
         elif isinstance(statement, DropView):
             self._compile_drop_view(statement)
+        elif isinstance(statement, CreateTrigger):
+            self._compile_create_trigger(statement)
+        elif isinstance(statement, DropTrigger):
+            self._compile_drop_trigger(statement)
         elif isinstance(statement, Explain):
             self._compile_explain(statement)
         elif isinstance(statement, Analyze):
@@ -1228,6 +1232,83 @@ class Compiler:
             self.schema.views.pop(node.name, None)
         self.emit(Opcode.DropTable, P1=0, P4=node.name,
                   comment=f'DROP VIEW {node.name}')
+
+    # ── Triggers ──
+
+    def _compile_create_trigger(self, node: CreateTrigger):
+        self.emit(Opcode.Transaction, P1=1, comment='DDL begin write')
+        programs = []
+        for body_stmt in node.statements:
+            compiler = Compiler(self.schema, self.db,
+                               custom_aggregates=self.custom_aggregates)
+            prog = compiler.compile(body_stmt)
+            programs.append(prog)
+        td = TriggerDef(
+            name=node.name, table_name=node.table, sql='',
+            time=node.time, event=node.event,
+            programs=programs, parsed_ast=node,
+        )
+        td.sql = self._reconstruct_create_trigger_sql(node)
+        if self.schema:
+            self.schema.triggers[node.name] = td
+            from pysqlite.btree import BTree
+            btree = BTree(self.db, 1, is_table=True)
+            self.schema._insert_schema_entry(
+                btree, type_='trigger', name=node.name,
+                tbl_name=node.table, rootpage=0, sql=td.sql,
+            )
+        self.emit(Opcode.CreateTable, P1=0, P4=node.name,
+                  comment=f'CREATE TRIGGER {node.name}')
+
+    def _compile_drop_trigger(self, node: DropTrigger):
+        self.emit(Opcode.Transaction, P1=1, comment='DDL begin write')
+        if self.schema:
+            self.schema.triggers.pop(node.name, None)
+        self.emit(Opcode.DropTable, P1=0, P4=node.name,
+                  comment=f'DROP TRIGGER {node.name}')
+
+    def _reconstruct_create_trigger_sql(self, node: CreateTrigger) -> str:
+        parts = ['CREATE TRIGGER', node.name]
+        if node.time:
+            parts.append(node.time)
+        parts.append(node.event)
+        if node.columns:
+            parts.append(f"({', '.join(node.columns)})")
+        parts.append(f'ON {node.table}')
+        if node.for_each_row:
+            parts.append('FOR EACH ROW')
+        if node.when:
+            parts.append(f'WHEN ({self._expr_to_sql(node.when)})')
+        parts.append('BEGIN')
+        for stmt in node.statements:
+            parts.append(f'{self._reconstruct_dml_sql(stmt)};')
+        parts.append('END')
+        return ' '.join(parts)
+
+    def _reconstruct_dml_sql(self, stmt) -> str:
+        if isinstance(stmt, Insert):
+            cols = f"({', '.join(stmt.columns)})" if stmt.columns else ''
+            if stmt.values:
+                rows = []
+                for row in stmt.values:
+                    vals = ', '.join(self._expr_to_sql(v) for v in row)
+                    rows.append(f'({vals})')
+                return f'INSERT INTO {stmt.table.name} {cols} VALUES {", ".join(rows)}'
+            elif stmt.select:
+                return f'INSERT INTO {stmt.table.name} {cols} {self._reconstruct_select_sql(stmt.select)}'
+            return f'INSERT INTO {stmt.table.name} DEFAULT VALUES'
+        if isinstance(stmt, Update):
+            sets = ', '.join(f'{sc.column} = {self._expr_to_sql(sc.expr)}' for sc in stmt.set_clauses)
+            sql = f'UPDATE {stmt.table.name} SET {sets}'
+            if stmt.where:
+                sql += f' WHERE {self._expr_to_sql(stmt.where)}'
+            return sql
+        if isinstance(stmt, Delete):
+            sql = f'DELETE FROM {stmt.table.name}'
+            if stmt.where:
+                sql += f' WHERE {self._expr_to_sql(stmt.where)}'
+            return sql
+        return ''
 
     def _reconstruct_select_sql(self, select: Select) -> str:
         parts = ['SELECT']

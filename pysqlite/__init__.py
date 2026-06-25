@@ -57,6 +57,7 @@ class Database:
         from pysqlite.parser import Parser
         from pysqlite.compile import Compiler
         from pysqlite.vm import VM
+        from pysqlite.ast import Insert, Update, Delete
 
         lexer = Lexer(sql)
         tokens = lexer.tokenize()
@@ -65,15 +66,51 @@ class Database:
 
         results = []
         for stmt in statements:
+            table_name = None
+            event = None
+            if isinstance(stmt, Insert):
+                event = 'INSERT'
+                table_name = stmt.table.name if hasattr(stmt.table, 'name') else str(stmt.table)
+            elif isinstance(stmt, Update):
+                event = 'UPDATE'
+                table_name = stmt.table.name if hasattr(stmt.table, 'name') else str(stmt.table)
+            elif isinstance(stmt, Delete):
+                event = 'DELETE'
+                table_name = stmt.table.name if hasattr(stmt.table, 'name') else str(stmt.table)
+
+            # Find matching triggers on this table
+            before_triggers = []
+            after_triggers = []
+            if event and table_name:
+                for t in self.schema.triggers.values():
+                    if t.table_name.upper() == table_name.upper() and t.event == event:
+                        if t.time in ('BEFORE', 'INSTEAD OF'):
+                            before_triggers.append(t)
+                        elif t.time == 'AFTER':
+                            after_triggers.append(t)
+
             compiler = Compiler(self.schema, self.pager,
                                 custom_aggregates=set(self._custom_aggregates.keys()))
             program = compiler.compile(stmt)
             columns = compiler.result_columns
+
             vm = VM(self.pager, self.tx,
                     custom_functions=self._custom_functions,
                     custom_aggregates=self._custom_aggregates)
+
+            # Run BEFORE triggers
+            for trig in before_triggers:
+                for prog in trig.programs:
+                    vm.run(prog, params=params)
+
+            # Run main statement
             rows = vm.run(program, params=params)
             results.append(QueryResult(rows, columns=columns))
+
+            # Run AFTER triggers
+            for trig in after_triggers:
+                for prog in trig.programs:
+                    vm.run(prog, params=params)
 
         return results if len(results) != 1 else results[0]
 

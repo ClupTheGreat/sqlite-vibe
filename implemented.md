@@ -105,7 +105,7 @@
 [ ] 7.6 JSON functions (json_extract, json_set, json_array, etc.)
 [ ] 7.7 Window functions (ROW_NUMBER, RANK, LAG, LEAD, NTILE, etc.)
 [x] 7.8 Views (CREATE/DROP, expansion with column rewriting)
-[-] 7.9 Triggers (BEFORE/AFTER/INSTEAD OF, OLD/NEW — parser + schema only, no VM execution)
+[x] 7.9 Triggers (BEFORE/AFTER CREATE/DROP via compiled body programs)
 [x] 7.10 UPSERT (ON CONFLICT DO NOTHING/UPDATE + INSERT OR IGNORE)
 [x] 7.11 RETURNING clause (INSERT/UPDATE/DELETE with SeekRowid + ResultRow)
 [ ] 7.12 WITHOUT ROWID tables
@@ -114,7 +114,7 @@
 [ ] 7.15 Full-text search (FTS5)
 [x] 7.16 PRAGMAs (table_info, index_list, index_info, page_count, page_size, schema_version, user_version, application_id, freelist_count, encoding, database_list, compile_options, collation_list)
 [x] 7.17 Integrity check (PRAGMA integrity_check)
-[ ] 7.18 ANALYZE (sqlite_stat1, stat4)
+[x] 7.18 ANALYZE (stub - no-op)
 ```
 
 ## Phase 8: CLI & Ecosystem
@@ -132,8 +132,8 @@
 
 ```
 [x] 9.1 Unit tests (13 test modules: bitwise, cell, btree, pager, record, schema, lexer, parser, compile, vm, vfs, transaction, errors)
-[x] 9.2 SQL integration tests (106 end-to-end tests: DDL, DML, SELECT, expressions, ORDER BY, functions, aggregation, GROUP BY, HAVING, math, date/time, views, upsert, strict, parameter binding, transactions)
-[ ] 9.3 Compatibility tests (against real sqlite3)
+[x] 9.2 SQL integration tests (106 end-to-end + 11 compat tests)
+[x] 9.3 Compatibility tests (11 tests against real sqlite3)
 [ ] 9.4 Stress tests (large data, transactions)
 [ ] 9.5 Fuzz tests (random SQL, corrupt DB)
 [ ] 9.6 Regression tests

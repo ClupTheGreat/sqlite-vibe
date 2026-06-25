@@ -415,6 +415,8 @@ class Parser:
         return CreateView(name=name, select=select, temp=temp, if_not_exists=if_not_exists)
 
     def _parse_create_trigger(self) -> CreateTrigger:
+        self.advance()  # skip TRIGGER
+        name = self.expect(TokenType.IDENTIFIER).value
         time = 'BEFORE'
         if self.match(TokenType.BEFORE):
             time = 'BEFORE'
@@ -446,7 +448,7 @@ class Parser:
             stmts.append(self._parse_statement())
             self.match(TokenType.SEMI)
         self.expect(TokenType.END)
-        return CreateTrigger(name='', table=table, statements=stmts,
+        return CreateTrigger(name=name, table=table, statements=stmts,
                              time=time, event=event, columns=columns,
                              for_each_row=for_each_row, when=when)
 
