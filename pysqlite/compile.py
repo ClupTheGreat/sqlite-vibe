@@ -49,6 +49,7 @@ class Compiler:
         self.next_register = 0
         self.next_cursor = 0
         self.loop_break_label: str | None = None
+        self._col_reg_map: dict[str, int] | None = None  # {col_name_upper: reg} for generated cols
 
         self.reg_zero = self.alloc_reg()
         self.reg_one = self.alloc_reg()
@@ -280,14 +281,26 @@ class Compiler:
                       comment=f'param {pname}')
 
         elif isinstance(expr, ColumnRef):
-            if expr.table:
-                ref_cursor = self._cursor_for_table(expr.table, cursor)
+            if self._col_reg_map is not None and expr.name.upper() in self._col_reg_map:
+                src_reg = self._col_reg_map[expr.name.upper()]
+                self.emit(Opcode.MemCopy, P1=src_reg, P2=reg,
+                          comment=f'gen col ref {expr.name}')
             else:
-                ref_cursor = cursor
-            table_def = self._lookup_table(ref_cursor)
-            col_idx = self._column_index(table_def, expr.name)
-            self.emit(Opcode.Column, P1=ref_cursor, P2=col_idx, P3=reg,
-                      comment=f'column {expr.name}')
+                if expr.table:
+                    ref_cursor = self._cursor_for_table(expr.table, cursor)
+                else:
+                    ref_cursor = cursor
+                table_def = self._lookup_table(ref_cursor)
+                # Check if this is a VIRTUAL generated column
+                if table_def and hasattr(table_def, 'columns'):
+                    for scol in table_def.columns:
+                        if scol.name.upper() == expr.name.upper() and scol.is_generated:
+                            if scol.generated_type == 'VIRTUAL' and scol.generated_expr is not None:
+                                self._compile_expr_to(scol.generated_expr, reg, ref_cursor)
+                                return
+                col_idx = self._column_index(table_def, expr.name)
+                self.emit(Opcode.Column, P1=ref_cursor, P2=col_idx, P3=reg,
+                          comment=f'column {expr.name}')
 
         elif isinstance(expr, UnaryOp):
             operand_reg = self.compile_expr(expr.operand, cursor)
@@ -594,11 +607,17 @@ class Compiler:
             if isinstance(rc.expr, StarExpr):
                 td = self._lookup_table(cursor)
                 for i in range(len(getattr(td, 'columns', []))):
-                    self.result_columns.append(getattr(td.columns[i], 'name', f'col{i}') if hasattr(td, 'columns') and i < len(td.columns) else f'col{i}')
-                    r = self.alloc_reg()
-                    col_regs.append(r)
-                    self.emit(Opcode.Column, P1=cursor, P2=i, P3=r,
-                              comment=f'column {i}')
+                    col = td.columns[i] if hasattr(td, 'columns') and i < len(td.columns) else None
+                    self.result_columns.append(col.name if col else f'col{i}')
+                    if col and col.is_generated and col.generated_type == 'VIRTUAL' and col.generated_expr is not None:
+                        r = self.alloc_reg()
+                        col_regs.append(r)
+                        self._compile_expr_to(col.generated_expr, r, cursor)
+                    else:
+                        r = self.alloc_reg()
+                        col_regs.append(r)
+                        self.emit(Opcode.Column, P1=cursor, P2=i, P3=r,
+                                  comment=f'column {i}')
             else:
                 r = self.compile_expr(rc.expr, cursor)
                 col_regs.append(r)
@@ -1043,6 +1062,41 @@ class Compiler:
                 for val in row:
                     vr = self.compile_expr(val, 0)
                     val_regs.append(vr)
+                # Expand generated column values before rowid (keeps val_regs contiguous)
+                n_user = len(val_regs)
+                if node.columns:
+                    col_provided = {}
+                    for vi, col_name in enumerate(node.columns):
+                        try:
+                            ci = td.column_index(col_name)
+                            col_provided[ci] = vi
+                        except ValueError:
+                            pass
+                else:
+                    col_provided = {vi: vi for vi in range(n_user)}
+                gen_map = {}
+                for ci, col in enumerate(td.columns):
+                    if ci in col_provided:
+                        gen_map[col.name.upper()] = val_regs[col_provided[ci]]
+                    elif col.is_generated and col.generated_type == 'STORED':
+                        self._col_reg_map = dict(gen_map)
+                        vr = self.compile_expr(col.generated_expr, 0)
+                        self._col_reg_map = None
+                        val_regs.append(vr)
+                        gen_map[col.name.upper()] = vr
+                    elif col.is_generated and col.generated_type == 'VIRTUAL':
+                        vr = self.alloc_reg()
+                        self.emit(Opcode.Null, P1=vr, comment='VIRTUAL placeholder')
+                        val_regs.append(vr)
+                # Compact val_regs to be contiguous for MakeRecord
+                n_total = len(val_regs)
+                if n_total > 0:
+                    first = val_regs[0]
+                    for i, r in enumerate(val_regs):
+                        if r != first + i:
+                            self.emit(Opcode.MemCopy, P1=r, P2=first + i,
+                                      comment='compact val')
+                    val_regs = list(range(first, first + n_total))
                 rowid_reg = self.alloc_reg()
                 # For WITHOUT ROWID tables, use PK value as key (no NewRowid)
                 if td.without_rowid:
@@ -1386,6 +1440,20 @@ class Compiler:
                     self.emit(Opcode.MemCopy, P1=set_reg, P2=col_regs[col_idx],
                               comment=f'set {sc.column}')
 
+        # Recompute STORED generated columns (all of them, per SQLite semantics)
+        if any(col.is_generated for col in td.columns):
+            gen_map = {}
+            for ci, col in enumerate(td.columns):
+                gen_map[col.name.upper()] = col_regs[ci]
+            self._col_reg_map = dict(gen_map)
+            for ci, col in enumerate(td.columns):
+                if col.is_generated and col.generated_type == 'STORED':
+                    vr = self.compile_expr(col.generated_expr, 0)
+                    if vr != col_regs[ci]:
+                        self.emit(Opcode.MemCopy, P1=vr, P2=col_regs[ci],
+                                  comment=f'recompute {col.name}')
+            self._col_reg_map = None
+
         # ON UPDATE RESTRICT check BEFORE the delete
         if fk_restrict_actions:
             offset = len(fk_old_regs) - sum(len(a['parent_indices']) for a in fk_restrict_actions)
@@ -1471,6 +1539,7 @@ class Compiler:
         columns = []
         for col in node.columns:
             affinity = self.schema._determine_affinity(col.type_name)
+            gen_expr, gen_type = (self.schema._get_generated(col) if hasattr(self.schema, '_get_generated') else (None, None))
             columns.append(SchemaColumnDef(
                 name=col.name,
                 type_name=col.type_name,
@@ -1481,6 +1550,9 @@ class Compiler:
                 default_value=self.schema._get_default(col) if hasattr(self.schema, '_get_default') else None,
                 auto_increment=self.schema._has_autoinc(col) if hasattr(self.schema, '_has_autoinc') else False,
                 collation=self.schema._get_collation(col) if hasattr(self.schema, '_get_collation') else None,
+                is_generated=gen_expr is not None,
+                generated_expr=gen_expr,
+                generated_type=gen_type,
             ))
         from pysqlite.schema import TableDef
         foreign_keys = []
@@ -1540,6 +1612,12 @@ class Compiler:
                         col_sql += f' ({", ".join(fk.parent_columns)})'
                     elif len(fk.columns) > 1 or (len(fk.columns) == 1 and fk.columns[0] != col.name):
                         col_sql += f' ({", ".join(fk.columns)})'
+                elif c.kind == 'GENERATED':
+                    details = c.details
+                    if isinstance(details, dict):
+                        expr_sql = self._expr_to_sql(details.get('expr'))
+                        storage = details.get('storage', 'VIRTUAL')
+                        col_sql += f' GENERATED ALWAYS AS ({expr_sql}) {storage}'
             col_parts.append(col_sql)
         for tc in node.constraints:
             if tc.kind == 'FOREIGN KEY' and hasattr(tc, 'details') and tc.details:

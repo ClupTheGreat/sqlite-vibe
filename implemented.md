@@ -110,7 +110,7 @@
 [x] 7.11 RETURNING clause (INSERT/UPDATE/DELETE with SeekRowid + ResultRow)
 [x] 7.12 WITHOUT ROWID tables
 [x] 7.13 STRICT tables (type enforcement on INSERT)
-[ ] 7.14 Generated columns (VIRTUAL/STORED)
+[x] 7.14 Generated columns (VIRTUAL/STORED)
 [ ] 7.15 Full-text search (FTS5)
 [x] 7.16 PRAGMAs (table_info, index_list, index_info, page_count, page_size, schema_version, user_version, application_id, freelist_count, encoding, database_list, compile_options, collation_list)
 [x] 7.17 Integrity check (PRAGMA integrity_check)

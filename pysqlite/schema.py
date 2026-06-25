@@ -472,6 +472,18 @@ class Schema:
                 return c.details
         return None
 
+    @staticmethod
+    def _get_generated(col_def: AstColumnDef) -> tuple[Expr | None, str | None]:
+        """Extract generated column info from AST column definition.
+        Returns (generated_expr, generated_type) or (None, None)."""
+        for c in col_def.constraints:
+            if c.kind == 'GENERATED':
+                details = c.details
+                if isinstance(details, dict):
+                    return details.get('expr'), details.get('storage')
+                return None, None
+        return None, None
+
     # ── Schema version ──
 
     def increment_version(self):

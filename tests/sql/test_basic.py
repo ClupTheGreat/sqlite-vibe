@@ -694,3 +694,83 @@ class TestWithoutRowid:
         db.execute("INSERT INTO t VALUES ('key2', 20)")
         res = db.execute('SELECT * FROM t ORDER BY a')
         assert res == [['key1', 10], ['key2', 20]]
+
+
+class TestGeneratedColumns:
+    def test_create_virtual(self, db):
+        res = db.execute('CREATE TABLE t (a INT, b INT GENERATED ALWAYS AS (a * 2) VIRTUAL)')
+        assert res == []
+
+    def test_create_stored(self, db):
+        res = db.execute('CREATE TABLE t (a INT, b INT GENERATED ALWAYS AS (a * 2) STORED)')
+        assert res == []
+
+    def test_insert_stored_no_column_list(self, db):
+        db.execute('CREATE TABLE t (a INT, b INT GENERATED ALWAYS AS (a * 2) STORED)')
+        db.execute("INSERT INTO t VALUES (5)")
+        res = db.execute('SELECT * FROM t')
+        assert res == [[5, 10]]
+
+    def test_insert_stored_explicit_cols(self, db):
+        db.execute('CREATE TABLE t (a INT, b INT GENERATED ALWAYS AS (a * 2) STORED)')
+        db.execute("INSERT INTO t (a) VALUES (7)")
+        res = db.execute('SELECT * FROM t')
+        assert res == [[7, 14]]
+
+    def test_update_stored_recompute(self, db):
+        db.execute('CREATE TABLE t (a INT, b INT GENERATED ALWAYS AS (a * 2) STORED)')
+        db.execute("INSERT INTO t (a) VALUES (3)")
+        db.execute("UPDATE t SET a = 10")
+        res = db.execute('SELECT b FROM t')
+        assert res == [[20]]
+
+    def test_update_stored_no_change(self, db):
+        db.execute('CREATE TABLE t (a INT, b INT GENERATED ALWAYS AS (a * 2) STORED)')
+        db.execute("INSERT INTO t (a) VALUES (5)")
+        db.execute("UPDATE t SET a = 5")
+        res = db.execute('SELECT b FROM t')
+        assert res == [[10]]
+
+    def test_virtual_in_select(self, db):
+        db.execute('CREATE TABLE t (a INT, b INT GENERATED ALWAYS AS (a + 1) VIRTUAL)')
+        db.execute("INSERT INTO t (a) VALUES (10)")
+        res = db.execute('SELECT b FROM t')
+        assert res == [[11]]
+
+    def test_virtual_in_where(self, db):
+        db.execute('CREATE TABLE t (a INT, b INT GENERATED ALWAYS AS (a * 3) VIRTUAL)')
+        db.execute("INSERT INTO t (a) VALUES (2)")
+        db.execute("INSERT INTO t (a) VALUES (5)")
+        res = db.execute('SELECT a FROM t WHERE b > 10')
+        assert res == [[5]]
+
+    def test_virtual_in_order_by(self, db):
+        db.execute('CREATE TABLE t (a INT, b INT GENERATED ALWAYS AS (a * -1) VIRTUAL)')
+        db.execute("INSERT INTO t (a) VALUES (3)")
+        db.execute("INSERT INTO t (a) VALUES (1)")
+        res = db.execute('SELECT a FROM t ORDER BY b')
+        assert res == [[3], [1]]
+
+    def test_multiple_generated_cols(self, db):
+        db.execute('''
+            CREATE TABLE t (
+                x INT,
+                y INT GENERATED ALWAYS AS (x + 1) STORED,
+                z INT GENERATED ALWAYS AS (y * 2) STORED
+            )
+        ''')
+        db.execute("INSERT INTO t (x) VALUES (5)")
+        res = db.execute('SELECT * FROM t')
+        assert res == [[5, 6, 12]]
+
+    def test_insert_all_columns_explicit(self, db):
+        db.execute('CREATE TABLE t (a INT, b INT GENERATED ALWAYS AS (a * 2) STORED)')
+        db.execute("INSERT INTO t (a, b) VALUES (4, 999)")
+        res = db.execute('SELECT * FROM t')
+        assert res == [[4, 999]]
+
+    def test_virtual_and_stored_mixed(self, db):
+        db.execute('CREATE TABLE t (a INT, b INT GENERATED ALWAYS AS (a + 1) VIRTUAL, c INT GENERATED ALWAYS AS (b * 2) STORED)')
+        db.execute("INSERT INTO t (a) VALUES (3)")
+        res = db.execute('SELECT * FROM t')
+        assert res == [[3, 4, 8.0]]
