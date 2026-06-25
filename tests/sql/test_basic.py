@@ -774,3 +774,62 @@ class TestGeneratedColumns:
         db.execute("INSERT INTO t (a) VALUES (3)")
         res = db.execute('SELECT * FROM t')
         assert res == [[3, 4, 8.0]]
+
+
+class TestForeignKeyUpdate:
+    def test_on_update_cascade(self, db):
+        db.execute('CREATE TABLE p (id INT PRIMARY KEY, val TEXT)')
+        db.execute('CREATE TABLE c (id INT, p_id INT REFERENCES p(id) ON UPDATE CASCADE)')
+        db.execute("INSERT INTO p VALUES (1, 'a')")
+        db.execute("INSERT INTO p VALUES (2, 'b')")
+        db.execute("INSERT INTO c VALUES (10, 1)")
+        db.execute("INSERT INTO c VALUES (20, 2)")
+        db.execute("UPDATE p SET id = 100 WHERE id = 1")
+        res = db.execute('SELECT * FROM c')
+        assert res == [[10, 100], [20, 2]]
+
+    def test_on_update_set_null(self, db):
+        db.execute('CREATE TABLE p (id INT PRIMARY KEY, val TEXT)')
+        db.execute('CREATE TABLE c (id INT, p_id INT REFERENCES p(id) ON UPDATE SET NULL)')
+        db.execute("INSERT INTO p VALUES (1, 'a')")
+        db.execute("INSERT INTO c VALUES (10, 1)")
+        db.execute("UPDATE p SET id = 100 WHERE id = 1")
+        res = db.execute('SELECT * FROM c')
+        assert res == [[10, None]]
+
+    def test_on_update_set_default(self, db):
+        db.execute("CREATE TABLE p (id INT PRIMARY KEY, val TEXT)")
+        db.execute("CREATE TABLE c (id INT, p_id INT DEFAULT 99 REFERENCES p(id) ON UPDATE SET DEFAULT)")
+        db.execute("INSERT INTO p VALUES (1, 'a')")
+        db.execute("INSERT INTO p VALUES (99, 'default')")
+        db.execute("INSERT INTO c VALUES (10, 1)")
+        db.execute("UPDATE p SET id = 100 WHERE id = 1")
+        res = db.execute('SELECT * FROM c')
+        assert res == [[10, 99]]
+
+    def test_on_update_restrict(self, db):
+        db.execute('CREATE TABLE p (id INT PRIMARY KEY, val TEXT)')
+        db.execute('CREATE TABLE c (id INT, p_id INT REFERENCES p(id) ON UPDATE RESTRICT)')
+        db.execute("INSERT INTO p VALUES (1, 'a')")
+        db.execute("INSERT INTO c VALUES (10, 1)")
+        with pytest.raises(Exception, match='FOREIGN KEY constraint failed'):
+            db.execute("UPDATE p SET id = 100 WHERE id = 1")
+
+    def test_on_delete_cascade(self, db):
+        db.execute('CREATE TABLE p (id INT PRIMARY KEY, val TEXT)')
+        db.execute('CREATE TABLE c (id INT, p_id INT REFERENCES p(id) ON DELETE CASCADE)')
+        db.execute("INSERT INTO p VALUES (1, 'a')")
+        db.execute("INSERT INTO p VALUES (2, 'b')")
+        db.execute("INSERT INTO c VALUES (10, 1)")
+        db.execute("INSERT INTO c VALUES (20, 2)")
+        db.execute("DELETE FROM p WHERE id = 1")
+        res = db.execute('SELECT * FROM c')
+        assert res == [[20, 2]]
+
+    def test_on_delete_restrict(self, db):
+        db.execute('CREATE TABLE p (id INT PRIMARY KEY, val TEXT)')
+        db.execute('CREATE TABLE c (id INT, p_id INT REFERENCES p(id) ON DELETE RESTRICT)')
+        db.execute("INSERT INTO p VALUES (1, 'a')")
+        db.execute("INSERT INTO c VALUES (10, 1)")
+        with pytest.raises(Exception, match='FOREIGN KEY constraint failed'):
+            db.execute("DELETE FROM p WHERE id = 1")
