@@ -672,7 +672,7 @@ class Parser:
                 return [TableName(name=name.name, schema=name.schema)] + (
                     [next_table] if not isinstance(next_table, list) else next_table)
             jc = self._parse_join()
-            jc.table = TableName(name=name.name, schema=name.schema)
+            jc.left = TableName(name=name.name, schema=name.schema)
             return jc
         return name
 
@@ -703,7 +703,7 @@ class Parser:
             while self.match(TokenType.COMMA):
                 using.append(self.expect(TokenType.IDENTIFIER).value)
             self.expect(TokenType.RPAREN)
-        return JoinClause(type=join_type, outer=outer, table=table,
+        return JoinClause(type=join_type, outer=outer, right=table,
                           on=on, using=using)
 
     def _parse_window_def(self) -> tuple[str, WindowDef]:
@@ -962,11 +962,8 @@ class Parser:
             name = self.expect(TokenType.IDENTIFIER).value
         value = None
         if self.match(TokenType.EQ):
-            if self.peek() in (TokenType.IDENTIFIER, TokenType.INTEGER,
-                               TokenType.FLOAT, TokenType.STRING):
-                value = self.advance().value
-            else:
-                value = self._parse_expr()
+            tok = self.advance()
+            value = tok.value
         elif self.match(TokenType.LPAREN):
             value = self._parse_expr()
             self.expect(TokenType.RPAREN)

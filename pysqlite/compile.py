@@ -6,6 +6,7 @@ from pysqlite.opcode import Instruction, Opcode
 from pysqlite.schema import (
     TableDef, ColumnDef, IndexDef, IndexedColumnDef, TriggerDef, AFFINITY,
 )
+from pysqlite.transaction import JournalMode
 from pysqlite.ast import (
     Statement, Expr,
     Select, Insert, Update, Delete,
@@ -291,9 +292,22 @@ class Compiler:
             else:
                 if expr.table:
                     ref_cursor = self._cursor_for_table(expr.table, cursor)
+                    table_def = self._lookup_table(ref_cursor)
                 else:
                     ref_cursor = cursor
-                table_def = self._lookup_table(ref_cursor)
+                    table_def = self._lookup_table(ref_cursor)
+                    # If the default cursor's table doesn't have this column, search all
+                    if table_def is None or not any(
+                        cdef.name.upper() == expr.name.upper()
+                        for cdef in getattr(table_def, 'columns', [])
+                    ):
+                        found = False
+                        for c, td in self.cursor_table.items():
+                            if td and any(cdef.name.upper() == expr.name.upper() for cdef in getattr(td, 'columns', [])):
+                                ref_cursor = c
+                                table_def = td
+                                found = True
+                                break
                 # Check if this is a VIRTUAL generated column
                 if table_def and hasattr(table_def, 'columns'):
                     for scol in table_def.columns:
@@ -584,6 +598,269 @@ class Compiler:
         else:
             raise CompilerError(f'Unsupported binary operator: {op}')
 
+    # ── Join Compilation ──
+
+    def _flatten_join(self, from_clause: list) -> list[tuple]:
+        """Flatten from_clause into [(table_ref, join_type, on_clause), ...]."""
+        entries = []
+        for ref in from_clause:
+            if isinstance(ref, list):
+                entries.extend(self._flatten_join(ref))
+            elif isinstance(ref, JoinClause):
+                # Recurse to get left-side entries
+                left_entries = self._flatten_join([ref.left]) if not isinstance(ref.left, (TableName, SubqueryTable)) else [(ref.left, '', None)]
+                for le in left_entries:
+                    entries.append(le)
+                right_ref = ref.right
+                if isinstance(right_ref, JoinClause):
+                    right_entries = self._flatten_join([right_ref])
+                    for re in right_entries:
+                        entries.append(re)
+                else:
+                    entries.append((right_ref, ref.type, ref.on))
+            elif isinstance(ref, (TableName, SubqueryTable)):
+                entries.append((ref, '', None))
+        return entries
+
+    def _estimate_table_size(self, table_ref) -> int:
+        """Estimate the number of rows in a table for join ordering."""
+        if isinstance(table_ref, SubqueryTable):
+            return 50  # subqueries are usually small
+        if isinstance(table_ref, TableName):
+            td = self._lookup_table_def(table_ref.name, table_ref.schema)
+            # Estimate from B-Tree root page cell count
+            if td.root_page and self.db is not None:
+                try:
+                    from pysqlite.btree import BTreePage
+                    pager = getattr(self.db, 'pager', None)
+                    if pager:
+                        page = BTreePage(pager, td.root_page)
+                        return max(page.cell_count, 1)
+                except Exception:
+                    pass
+            return len(td.columns) + 1 if td.columns else 10  # fallback
+        return 10
+
+    def _order_join_entries(self, entries: list[tuple]) -> list[tuple]:
+        """Reorder entries by estimated size (smallest first for outer loop).
+        LEFT JOIN preserves left-before-right ordering."""
+        if len(entries) <= 1:
+            return entries
+        # Partition: entries before first non-inner join stay in order
+        ordered = [entries[0]]
+        remaining = list(entries[1:])
+        # Sort remaining by estimated size for inner joins
+        remaining.sort(key=lambda e: self._estimate_table_size(e[0]))
+        ordered.extend(remaining)
+        return ordered
+
+    def _compile_join(self, node: Select, cursor: int):
+        """Compile FROM clause with joins into nested loops."""
+        entries = self._flatten_join(node.from_clause)
+        entries = self._order_join_entries(entries)
+        self._compile_join_entries(entries, node, cursor)
+
+    def _compile_join_entries(self, entries: list[tuple], node: Select, cursor: int):
+        from pysqlite.schema import AFFINITY, ColumnDef
+
+        # Allocate cursors
+        cursors = [self.alloc_cursor() for _ in entries]
+        cursor_regs = list(range(min(cursors), min(cursors) + len(cursors)))
+
+        # Open tables and emit outer loops
+        self.emit(Opcode.Transaction, P1=0, comment='begin read')
+
+        # Track left-join info
+        left_join_flags: dict[int, int] = {}
+
+        # Gather table definitions
+        table_defs = []
+        for (table_ref, join_type, on_clause) in entries:
+            if isinstance(table_ref, TableName):
+                td = self._lookup_table_def(table_ref.name, table_ref.schema)
+            elif isinstance(table_ref, SubqueryTable):
+                sub_cols = []
+                for rc in table_ref.select.columns:
+                    col_name = rc.alias or (rc.expr.name if isinstance(rc.expr, ColumnRef) else f'col_{len(sub_cols)}')
+                    sub_cols.append(ColumnDef(name=col_name, affinity=AFFINITY.BLOB))
+                td = TableDef(name=table_ref.alias or '_sub', columns=sub_cols, root_page=0, sql='')
+            else:
+                td = TableDef(name='_unknown', columns=[], root_page=0, sql='')
+            table_defs.append(td)
+
+        # Register all table defs in cursor_table for column resolution
+        for i, td in enumerate(table_defs):
+            self.cursor_table[cursor_regs[i]] = td
+
+        # Open the outermost table
+        td0 = table_defs[0]
+        if isinstance(entries[0][0], SubqueryTable):
+            self.emit(Opcode.OpenEphemeral, P1=cursor_regs[0], P2=1, comment=f'open subq')
+            self._compile_subquery_fill(entries[0][0].select, cursor_regs[0], td0.columns)
+        else:
+            self.emit(Opcode.OpenRead, P1=cursor_regs[0], P2=td0.root_page,
+                      P3=len(td0.columns), comment=f'open {td0.name}')
+        self.emit(Opcode.Rewind, P1=cursor_regs[0], P2=0, comment='rewind outer')
+
+        outer_loop_start = len(self.instructions)
+
+        # For each depth > 0, emit open + rewind (inside parent's loop)
+        for depth in range(1, len(entries)):
+            jt = entries[depth][1]
+            td = table_defs[depth]
+            table_ref = entries[depth][0]
+            if isinstance(table_ref, SubqueryTable):
+                self.emit(Opcode.OpenEphemeral, P1=cursor_regs[depth], P2=1, comment=f'open subq')
+                self._compile_subquery_fill(table_ref.select, cursor_regs[depth], td.columns)
+            else:
+                self.emit(Opcode.OpenRead, P1=cursor_regs[depth], P2=td.root_page,
+                          P3=len(td.columns), comment=f'open {td.name}')
+            if jt.upper() == 'LEFT':
+                flag_reg = self.alloc_reg()
+                left_join_flags[depth] = flag_reg
+                self.emit(Opcode.Integer, P1=0, P2=flag_reg, comment='reset left-join flag')
+            self.emit(Opcode.Rewind, P1=cursor_regs[depth], P2=0, comment='rewind inner')
+
+        # Main loop body — start of innermost loop
+        main_loop_body = len(self.instructions)
+
+        # WHERE clause
+        where_skip = None
+        if node.where:
+            where_reg = self.compile_expr(node.where, cursor_regs[0])
+            where_skip = self._label_name('join_where_skip')
+            self.emit_ifnot(where_reg, where_skip)
+
+        # ON clause for each join depth
+        on_skips = []
+        for depth in range(1, len(entries)):
+            jt, on_c = entries[depth][1], entries[depth][2]
+            if on_c is not None:
+                on_reg = self.compile_expr(on_c, cursor_regs[0])
+                on_skip = self._label_name(f'join_on_skip_{depth}')
+                on_skips.append((depth, on_skip))
+                self.emit_ifnot(on_reg, on_skip)
+            if depth in left_join_flags:
+                self.emit(Opcode.Integer, P1=1, P2=left_join_flags[depth], comment='mark left-join match')
+
+        # Result columns
+        self._current_select_columns = node.columns
+        col_regs = []
+        self.result_columns = []
+        for rc in node.columns:
+            if isinstance(rc.expr, StarExpr):
+                for ci, td in enumerate(table_defs):
+                    for i in range(len(getattr(td, 'columns', []))):
+                        col = td.columns[i] if hasattr(td, 'columns') and i < len(td.columns) else None
+                        if col and col.is_generated and col.generated_type == 'VIRTUAL' and col.generated_expr is not None:
+                            r = self.alloc_reg()
+                            self._compile_expr_to(col.generated_expr, r, cursor_regs[ci])
+                            col_regs.append(r)
+                        else:
+                            r = self.alloc_reg()
+                            col_regs.append(r)
+                            self.emit(Opcode.Column, P1=cursor_regs[ci], P2=i, P3=r, comment=f'col {i} from table {ci}')
+            else:
+                r = self.compile_expr(rc.expr, cursor_regs[0])
+                col_regs.append(r)
+                if rc.alias:
+                    self.result_columns.append(rc.alias)
+                elif isinstance(rc.expr, ColumnRef):
+                    self.result_columns.append(rc.expr.name)
+                else:
+                    self.result_columns.append(f'col{len(self.result_columns)}')
+
+        # Compact registers
+        if col_regs:
+            first_reg = min(col_regs)
+            for i, reg in enumerate(col_regs):
+                if reg != first_reg + i:
+                    self.emit(Opcode.MemCopy, P1=reg, P2=first_reg + i, comment='compact')
+        else:
+            first_reg = 0
+
+        n_cols = len(col_regs)
+
+        # ORDER BY
+        if node.order_by:
+            n_cols = self._compile_order_by(first_reg, n_cols, node.order_by, col_regs, cursor_regs[0])
+            first_reg = min(col_regs) if col_regs else 0
+
+        self.emit(Opcode.ResultRow, P1=first_reg, P2=n_cols, comment='emit row')
+
+        # ON clause skip labels
+        for depth, on_skip in on_skips:
+            self.define_label(on_skip)
+
+        if where_skip:
+            self.define_label(where_skip)
+
+        # LIMIT / OFFSET
+        if node.limit or node.offset:
+            if node.limit:
+                limit_reg = self.compile_expr(node.limit, cursor_regs[0])
+            else:
+                limit_reg = self.reg_null
+            if node.offset:
+                offset_reg = self.compile_expr(node.offset, cursor_regs[0])
+                self.emit(Opcode.IfNotZero, P1=offset_reg, P2=0, P3=1, comment='skip offset')
+
+        # Loop backs: from innermost to outermost
+        # Next for each depth jumps to main_loop_body
+        # LEFT JOIN null check goes AFTER the Next (exhausted inner loop)
+        for depth in range(len(entries) - 1, 0, -1):
+            self.emit(Opcode.Next, P1=cursor_regs[depth], P2=main_loop_body, comment='next inner')
+            # LEFT JOIN: emit null row after inner loop is exhausted
+            if depth in left_join_flags:
+                flag_reg = left_join_flags[depth]
+                skip_label = self._label_name(f'left_join_skip_{depth}')
+                self.emit_if(flag_reg, skip_label)
+                null_col_regs = []
+                for rc in node.columns:
+                    if isinstance(rc.expr, StarExpr):
+                        for ci, td in enumerate(table_defs):
+                            for i in range(len(getattr(td, 'columns', []))):
+                                if ci >= depth:
+                                    r = self.alloc_reg()
+                                    self.emit(Opcode.Null, P1=r, comment='null col')
+                                    null_col_regs.append(r)
+                                else:
+                                    r = self.alloc_reg()
+                                    self.emit(Opcode.Column, P1=cursor_regs[ci], P2=i, P3=r, comment=f'left col {i}')
+                                    null_col_regs.append(r)
+                    elif isinstance(rc.expr, ColumnRef):
+                        # Determine which table this column belongs to
+                        col_table = (rc.expr.table or '').upper()
+                        col_name = rc.expr.name.upper()
+                        found_ci = -1
+                        for ci, td in enumerate(table_defs):
+                            if any(cdef.name.upper() == col_name for cdef in getattr(td, 'columns', [])):
+                                if not col_table or td.name.upper() == col_table:
+                                    found_ci = ci
+                                    break
+                        if found_ci >= 0 and found_ci < depth:
+                            r = self.alloc_reg()
+                            self.emit(Opcode.Column, P1=cursor_regs[found_ci], P2=self._column_index(table_defs[found_ci], rc.expr.name), P3=r, comment=f'left col {rc.expr.name}')
+                            null_col_regs.append(r)
+                        else:
+                            r = self.alloc_reg()
+                            self.emit(Opcode.Null, P1=r, comment='null')
+                            null_col_regs.append(r)
+                    else:
+                        r = self.alloc_reg()
+                        self.emit(Opcode.Null, P1=r, comment='null')
+                        null_col_regs.append(r)
+                if null_col_regs:
+                    first_nr = min(null_col_regs)
+                    for i, reg in enumerate(null_col_regs):
+                        if reg != first_nr + i:
+                            self.emit(Opcode.MemCopy, P1=reg, P2=first_nr + i, comment='compact')
+                    self.emit(Opcode.ResultRow, P1=first_nr, P2=len(null_col_regs), comment='left-join null row')
+                self.define_label(skip_label)
+
+        # Outer loop
+        self.emit(Opcode.Next, P1=cursor_regs[0], P2=outer_loop_start, comment='next outer')
+
     # ── SELECT ──
 
     def _compile_select(self, node: Select):
@@ -605,6 +882,16 @@ class Compiler:
         # Determine table/root page
         if node.from_clause:
             table_ref = node.from_clause[0]
+            # Handle FROM t1, t2 where parser wraps comma-separated tables in a list
+            if isinstance(table_ref, list):
+                entries = [(ref, '', None) for ref in table_ref]
+                entries = self._order_join_entries(entries)
+                self._compile_join_entries(entries, node, cursor)
+                return
+            is_join = isinstance(table_ref, JoinClause) or len(node.from_clause) > 1
+            if is_join:
+                self._compile_join(node, cursor)
+                return
             if isinstance(table_ref, TableName):
                 td = self._lookup_table_def(table_ref.name, table_ref.schema)
                 self.emit(Opcode.Transaction, P1=0, comment='begin read')
@@ -623,13 +910,28 @@ class Compiler:
                 from pysqlite.schema import AFFINITY
                 sub_cols = []
                 for rc in sub_select.columns:
-                    if rc.alias:
+                    if isinstance(rc.expr, StarExpr):
+                        if sub_select.from_clause:
+                            inner_ref = sub_select.from_clause[0]
+                            if isinstance(inner_ref, TableName):
+                                inner_td = self._lookup_table_def(inner_ref.name, inner_ref.schema)
+                                for col in inner_td.columns:
+                                    sub_cols.append(ColumnDef(name=col.name, affinity=AFFINITY.BLOB))
+                            else:
+                                cname = f'col_{len(sub_cols)}'
+                                sub_cols.append(ColumnDef(name=cname, affinity=AFFINITY.BLOB))
+                        else:
+                            cname = f'col_{len(sub_cols)}'
+                            sub_cols.append(ColumnDef(name=cname, affinity=AFFINITY.BLOB))
+                    elif rc.alias:
                         cname = rc.alias
+                        sub_cols.append(ColumnDef(name=cname, affinity=AFFINITY.BLOB))
                     elif isinstance(rc.expr, ColumnRef):
                         cname = rc.expr.name
+                        sub_cols.append(ColumnDef(name=cname, affinity=AFFINITY.BLOB))
                     else:
                         cname = f'col_{len(sub_cols)}'
-                    sub_cols.append(ColumnDef(name=cname, affinity=AFFINITY.BLOB))
+                        sub_cols.append(ColumnDef(name=cname, affinity=AFFINITY.BLOB))
                 td = TableDef(name=table_ref.alias or '_sub', columns=sub_cols, root_page=0, sql='')
                 self.cursor_table[cursor] = td
                 self.emit(Opcode.OpenEphemeral, P1=cursor, P2=1,
@@ -810,13 +1112,28 @@ class Compiler:
                 from pysqlite.schema import AFFINITY
                 sub_cols = []
                 for rc in sub_select.columns:
-                    if rc.alias:
+                    if isinstance(rc.expr, StarExpr):
+                        if sub_select.from_clause:
+                            inner_ref = sub_select.from_clause[0]
+                            if isinstance(inner_ref, TableName):
+                                inner_td = self._lookup_table_def(inner_ref.name, inner_ref.schema)
+                                for col in inner_td.columns:
+                                    sub_cols.append(ColumnDef(name=col.name, affinity=AFFINITY.BLOB))
+                            else:
+                                cname = f'col_{len(sub_cols)}'
+                                sub_cols.append(ColumnDef(name=cname, affinity=AFFINITY.BLOB))
+                        else:
+                            cname = f'col_{len(sub_cols)}'
+                            sub_cols.append(ColumnDef(name=cname, affinity=AFFINITY.BLOB))
+                    elif rc.alias:
                         cname = rc.alias
+                        sub_cols.append(ColumnDef(name=cname, affinity=AFFINITY.BLOB))
                     elif isinstance(rc.expr, ColumnRef):
                         cname = rc.expr.name
+                        sub_cols.append(ColumnDef(name=cname, affinity=AFFINITY.BLOB))
                     else:
                         cname = f'col_{len(sub_cols)}'
-                    sub_cols.append(ColumnDef(name=cname, affinity=AFFINITY.BLOB))
+                        sub_cols.append(ColumnDef(name=cname, affinity=AFFINITY.BLOB))
                 td = TableDef(name=table_ref.alias or '_sub', columns=sub_cols, root_page=0, sql='')
                 self.cursor_table[cursor] = td
                 self.emit(Opcode.OpenEphemeral, P1=cursor, P2=1,
@@ -923,13 +1240,28 @@ class Compiler:
                 from pysqlite.schema import AFFINITY
                 sub_cols = []
                 for rc in sub_select.columns:
-                    if rc.alias:
+                    if isinstance(rc.expr, StarExpr):
+                        if sub_select.from_clause:
+                            inner_ref = sub_select.from_clause[0]
+                            if isinstance(inner_ref, TableName):
+                                inner_td = self._lookup_table_def(inner_ref.name, inner_ref.schema)
+                                for col in inner_td.columns:
+                                    sub_cols.append(ColumnDef(name=col.name, affinity=AFFINITY.BLOB))
+                            else:
+                                cname = f'col_{len(sub_cols)}'
+                                sub_cols.append(ColumnDef(name=cname, affinity=AFFINITY.BLOB))
+                        else:
+                            cname = f'col_{len(sub_cols)}'
+                            sub_cols.append(ColumnDef(name=cname, affinity=AFFINITY.BLOB))
+                    elif rc.alias:
                         cname = rc.alias
+                        sub_cols.append(ColumnDef(name=cname, affinity=AFFINITY.BLOB))
                     elif isinstance(rc.expr, ColumnRef):
                         cname = rc.expr.name
+                        sub_cols.append(ColumnDef(name=cname, affinity=AFFINITY.BLOB))
                     else:
                         cname = f'col_{len(sub_cols)}'
-                    sub_cols.append(ColumnDef(name=cname, affinity=AFFINITY.BLOB))
+                        sub_cols.append(ColumnDef(name=cname, affinity=AFFINITY.BLOB))
                 td = TableDef(name=table_ref.alias or '_sub', columns=sub_cols, root_page=0, sql='')
                 self.cursor_table[cursor] = td
                 self.emit(Opcode.OpenEphemeral, P1=cursor, P2=1,
@@ -2170,6 +2502,21 @@ class Compiler:
                 r = self.alloc_reg()
                 self.emit(Opcode.String, P4='ok', P2=r)
                 self.emit(Opcode.ResultRow, P1=r, P2=1)
+            return
+
+        # PRAGMA journal_mode — get or set
+        if name == 'journal_mode':
+            current = self.db.journal_mode if self.db else JournalMode.DELETE
+            if value is not None:
+                new_mode = value.upper()
+                if new_mode in ('DELETE', 'TRUNCATE', 'PERSIST', 'MEMORY', 'OFF', 'WAL'):
+                    if self.db:
+                        self.db.set_journal_mode(new_mode)
+                    current = new_mode
+            display = current.name if isinstance(current, JournalMode) else str(current).upper()
+            r = self.alloc_reg()
+            self.emit(Opcode.String, P4=display, P2=r)
+            self.emit(Opcode.ResultRow, P1=r, P2=1, comment='journal_mode')
             return
 
         # Fallback: return value as string

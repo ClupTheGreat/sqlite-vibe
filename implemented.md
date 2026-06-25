@@ -64,7 +64,7 @@
 [x] 4.6 Query compiler — DDL (CREATE/DROP TABLE/INDEX)
 [x] 4.7 Expression compiler (all expression types)
 [x] 4.8 Optimizer — index selection (PK seek for WHERE pk = value)
-[-] 4.9 Optimizer — join ordering
+[x] 4.9 Optimizer — join ordering (flatten, reorder by estimated size, nested-loop compilation for CROSS/INNER/LEFT JOIN)
 [x] 4.10 VM core (register system, dispatch loop)
 [x] 4.11 VM cursor operations
 [x] 4.12 VM comparisons (SQLite type ordering)
@@ -147,5 +147,5 @@
 [x] 10.2 B-Tree optimizations (bulk insert: bulk_insert() on BTreeCursor for sorted-key batch loading)
 [x] 10.3 Query compiler optimizations (constant folding for arithmetic, COUNT(*) via B-Tree leaf page cell_count)
 [x] 10.4 Pager optimizations (batch writes: flush() writes contiguous dirty pages in a single VFS write)
-[ ] 10.5 WAL mode for concurrency
+[x] 10.5 WAL mode for concurrency (PRAGMA journal_mode=WAL, readers use WAL index, writer appends to WAL, checkpoint support)
 ```

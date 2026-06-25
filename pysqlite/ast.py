@@ -231,7 +231,8 @@ class SubqueryTable:
 class JoinClause:
     type: str = ''  # '', LEFT, RIGHT, CROSS, NATURAL
     outer: bool = False
-    table: Any = None
+    left: Any = None
+    right: Any = None
     on: Expr | None = None
     using: list[str] = field(default_factory=list)
 

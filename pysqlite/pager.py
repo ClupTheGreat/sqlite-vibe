@@ -719,6 +719,24 @@ class Pager:
             finally:
                 self.vfs.unlock(self.handle, LOCK_SHARED)
 
+    def set_journal_mode(self, mode: str):
+        """Change the journal mode at runtime."""
+        from pysqlite.transaction import JournalMode
+        if mode == 'WAL':
+            self.journal_mode = JournalMode.WAL
+            if self.wal is None:
+                self.wal = WAL(self.vfs, self.handle.path, self.page_size)
+        elif mode == 'OFF':
+            self.journal_mode = JournalMode.OFF
+        elif mode == 'MEMORY':
+            self.journal_mode = JournalMode.MEMORY
+        elif mode == 'TRUNCATE':
+            self.journal_mode = JournalMode.TRUNCATE
+        elif mode == 'PERSIST':
+            self.journal_mode = JournalMode.PERSIST
+        else:
+            self.journal_mode = JournalMode.DELETE
+
     # ---- close ----
 
     def close(self):
