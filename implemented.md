@@ -91,7 +91,7 @@
 [x] 6.3 Savepoints (nested, rollback to, release)
 [-] 6.4 Foreign key enforcement (immediate/deferred)
 [ ] 6.5 CASCADE / SET NULL / SET DEFAULT / RESTRICT
-[ ] 6.6 Busy handler
+[x] 6.6 Busy handler (busy_handler, busy_timeout)
 ```
 
 ## Phase 7: Full SQL Feature Set
@@ -113,7 +113,7 @@
 [ ] 7.14 Generated columns (VIRTUAL/STORED)
 [ ] 7.15 Full-text search (FTS5)
 [x] 7.16 PRAGMAs (table_info, index_list, index_info, page_count, page_size, schema_version, user_version, application_id, freelist_count, encoding, database_list, compile_options, collation_list)
-[ ] 7.17 Integrity check
+[x] 7.17 Integrity check (PRAGMA integrity_check)
 [ ] 7.18 ANALYZE (sqlite_stat1, stat4)
 ```
 

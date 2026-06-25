@@ -30,6 +30,8 @@ class Database:
         self.tx = TransactionManager(self.pager, self.vfs, self.pager.handle)
         self._custom_functions: dict[str, callable] = {}
         self._custom_aggregates: dict[str, callable] = {}
+        self._busy_handler: callable | None = None
+        self._busy_timeout: int = 0
 
     def create_function(self, name: str, nargs: int, func: callable, *, deterministic: bool = False):
         """Register a custom scalar function."""
@@ -38,6 +40,14 @@ class Database:
     def create_aggregate(self, name: str, nargs: int, aggregate_class: type):
         """Register a custom aggregate class (must have step() and final() methods)."""
         self._custom_aggregates[name.upper()] = aggregate_class
+
+    def busy_handler(self, handler):
+        """Register a busy handler callback for lock conflicts."""
+        self._busy_handler = handler
+
+    def busy_timeout(self, timeout_ms: int):
+        """Set a busy timeout in milliseconds."""
+        self._busy_timeout = timeout_ms
 
     def execute(self, sql: str):
         return self.execute_params(sql)

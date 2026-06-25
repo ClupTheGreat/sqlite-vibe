@@ -294,6 +294,27 @@ When you encounter a problem during development, add an entry like:
     LockFileEx with OVERLAPPED hangs on Python 3.13/Windows.
     Need to investigate correct OVERLAPPED setup or use alternative
     locking via msvcrt.locking(). Not blocking any SQL functionality.
+
+[2026-06-25] SeekRowid label string used as P2 directly instead of via _patch_jump
+  - File: pysqlite/compile.py:814 (fixed)
+  - Severity: high
+  - Details: The ON CONFLICT DO UPDATE code path emitted SeekRowid with
+    P2=no_conflict_label (a string label name). The label was never resolved
+    to a PC address, so P2 remained the string 'upsert_no_conflict_0'.
+    SeekRowid passed this string as the key to btree.seek(), which then
+    compared it (str) against cell.rowid (int), causing '>' not supported
+    between instances of 'str' and 'int'. Fixed by emitting SeekRowid with
+    P2=0 then calling _patch_jump to properly register the label.
+
+[2026-06-25] ColumnRef compiled against wrong cursor (no table scoping)
+  - File: pysqlite/compile.py:252-258 (fixed)
+  - Severity: high
+  - Details: ColumnRef expressions (e.g., excluded.b in DO UPDATE SET clauses)
+    always used the current cursor instead of looking up the cursor for the
+    referenced table. When the SET clause referenced excluded.b, the compiler
+    read column b from the main table cursor instead of the EXCLUDED table
+    cursor. Fixed by adding _cursor_for_table helper that searches cursor_table
+    for the named table, falling back to the default cursor if not found.
 ```
 
 
