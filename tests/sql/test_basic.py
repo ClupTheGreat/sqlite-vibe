@@ -496,6 +496,38 @@ class TestSubqueryFrom:
         assert len(res) == 2
 
 
+class TestReturning:
+    def test_insert_returning_col(self, db):
+        db.execute('CREATE TABLE t (a INT, b TEXT)')
+        db.execute("INSERT INTO t VALUES (1, 'hello')")
+        res = db.execute("INSERT INTO t VALUES (2, 'world') RETURNING a")
+        assert res == [[2]]
+
+    def test_insert_returning_star(self, db):
+        db.execute('CREATE TABLE t (a INT, b TEXT)')
+        res = db.execute("INSERT INTO t VALUES (1, 'hello') RETURNING *")
+        assert res == [[1, 'hello']]
+
+    def test_insert_returning_multi(self, db):
+        db.execute('CREATE TABLE t (a INT, b TEXT)')
+        res = db.execute("INSERT INTO t VALUES (1, 'a'), (2, 'b') RETURNING a, b")
+        assert res == [[1, 'a'], [2, 'b']]
+
+    def test_update_returning_star(self, db):
+        db.execute('CREATE TABLE t (a INT, b TEXT)')
+        db.execute("INSERT INTO t VALUES (1, 'hello')")
+        db.execute("INSERT INTO t VALUES (2, 'world')")
+        res = db.execute("UPDATE t SET b = 'bar' WHERE a = 2 RETURNING *")
+        assert res == [[2, 'bar']]
+
+    def test_delete_returning_col(self, db):
+        db.execute('CREATE TABLE t (a INT)')
+        db.execute('INSERT INTO t VALUES (10)')
+        db.execute('INSERT INTO t VALUES (20)')
+        res = db.execute('DELETE FROM t WHERE a = 10 RETURNING a')
+        assert res == [[10]]
+
+
 class TestTransactions:
     def test_begin_commit(self, db):
         db.execute('CREATE TABLE t (a INT)')

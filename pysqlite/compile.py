@@ -715,6 +715,7 @@ class Compiler:
             self._compile_cte(node.ctes)
         td = self._lookup_table_def(node.table.name, node.table.schema)
         cursor = self.alloc_cursor()
+        self.cursor_table[cursor] = td
         self.emit(Opcode.Transaction, P1=1, comment='begin write')
         self.emit(Opcode.OpenWrite, P1=cursor, P2=td.root_page,
                   P3=len(td.columns), comment=f'open {td.name}')
@@ -728,8 +729,12 @@ class Compiler:
                       comment='default values record')
             self.emit(Opcode.Insert, P1=cursor, P2=record_reg, P3=rowid_reg,
                       comment='insert row')
+            if node.returning:
+                self.emit(Opcode.SeekRowid, P1=cursor, P2=0, P3=rowid_reg,
+                          comment='seek to inserted row for RETURNING')
+                self._compile_returning(cursor, node.returning)
         elif node.select:
-            self._compile_insert_select(node.select, cursor, td)
+            self._compile_insert_select(node.select, cursor, td, node.returning)
         elif node.values:
             col_count = len(td.columns) if not node.columns else len(node.columns)
             for row in node.values:
@@ -746,10 +751,19 @@ class Compiler:
                           P3=record_reg, comment='make record')
                 self.emit(Opcode.Insert, P1=cursor, P2=record_reg, P3=rowid_reg,
                           comment='insert row')
-        if node.returning:
-            self._compile_returning(cursor, node.returning)
+                if node.returning:
+                    self.emit(Opcode.SeekRowid, P1=cursor, P2=0, P3=rowid_reg,
+                              comment='seek to inserted row for RETURNING')
+                    self._compile_returning(cursor, node.returning)
+        else:
+            # DEFAULT VALUES
+            if node.returning:
+                self.emit(Opcode.SeekRowid, P1=cursor, P2=0, P3=rowid_reg,
+                          comment='seek to inserted row for RETURNING')
+                self._compile_returning(cursor, node.returning)
 
-    def _compile_insert_select(self, select: Select, dest_cursor: int, td: 'TableDef'):
+    def _compile_insert_select(self, select: Select, dest_cursor: int, td: 'TableDef',
+                                returning: Returning | None = None):
         if select.ctes:
             self._compile_cte(select.ctes)
         src_cursor = self.alloc_cursor()
@@ -789,8 +803,15 @@ class Compiler:
         self.emit(Opcode.Insert, P1=dest_cursor, P2=record_reg, P3=rowid_reg,
                   comment='insert row')
 
+        if returning:
+            self.emit(Opcode.SeekRowid, P1=dest_cursor, P2=0, P3=rowid_reg,
+                      comment='seek for RETURNING')
+            self._compile_returning(dest_cursor, returning)
+
         if select.from_clause:
             self.emit(Opcode.Next, P1=src_cursor, P2=loop_start, comment='next row')
+
+    # ── Subquery in FROM ──
 
     def _compile_subquery_fill(self, sub_select: Select, target_cursor: int, sub_cols: list):
         """Compile a subquery to fill an ephemeral table (for SubqueryTable in FROM)."""
@@ -856,6 +877,7 @@ class Compiler:
             self._compile_cte(node.ctes)
         td = self._lookup_table_def(node.table.name, node.table.schema)
         cursor = self.alloc_cursor()
+        self.cursor_table[cursor] = td
         self.emit(Opcode.Transaction, P1=1, comment='begin write')
         self.emit(Opcode.OpenWrite, P1=cursor, P2=td.root_page,
                   P3=len(td.columns), comment=f'open {td.name}')
@@ -896,11 +918,14 @@ class Compiler:
         self.emit(Opcode.Insert, P1=cursor, P2=record_reg, P3=rowid_reg,
                   comment='insert updated row')
 
+        if node.returning:
+            self.emit(Opcode.SeekRowid, P1=cursor, P2=0, P3=rowid_reg,
+                      comment='seek for RETURNING')
+            self._compile_returning(cursor, node.returning)
+
         if node.where:
             self.define_label(skip_label)
         self.emit(Opcode.Next, P1=cursor, P2=loop_start, comment='next row')
-        if node.returning:
-            self._compile_returning(cursor, node.returning)
 
     # ── DELETE ──
 
@@ -909,6 +934,7 @@ class Compiler:
             self._compile_cte(node.ctes)
         td = self._lookup_table_def(node.table.name, node.table.schema)
         cursor = self.alloc_cursor()
+        self.cursor_table[cursor] = td
         self.emit(Opcode.Transaction, P1=1, comment='begin write')
         self.emit(Opcode.OpenWrite, P1=cursor, P2=td.root_page,
                   P3=len(td.columns), comment=f'open {td.name}')
@@ -920,12 +946,12 @@ class Compiler:
             skip_label = self._label_name('delete_skip')
             self.emit_ifnot(where_reg, skip_label)
 
+        if node.returning:
+            self._compile_returning(cursor, node.returning)
         self.emit(Opcode.Delete, P1=cursor, comment='delete row')
         if node.where:
             self.define_label(skip_label)
         self.emit(Opcode.Next, P1=cursor, P2=loop_start, comment='next row')
-        if node.returning:
-            self._compile_returning(cursor, node.returning)
 
     # ── DDL ──
 
@@ -1280,9 +1306,25 @@ class Compiler:
     # ── RETURNING ──
 
     def _compile_returning(self, cursor: int, ret: Returning):
+        col_regs = []
         for rc in ret.columns:
-            reg = self.compile_expr(rc.expr, cursor)
-            self.emit(Opcode.ResultColumn, P1=reg, comment='RETURNING')
+            if isinstance(rc.expr, StarExpr):
+                td = self._lookup_table(cursor)
+                for i in range(len(getattr(td, 'columns', []))):
+                    r = self.alloc_reg()
+                    col_regs.append(r)
+                    self.emit(Opcode.Column, P1=cursor, P2=i, P3=r,
+                              comment=f'returning col {i}')
+            else:
+                r = self.compile_expr(rc.expr, cursor)
+                col_regs.append(r)
+        if col_regs:
+            first_reg = min(col_regs)
+            n_cols = len(col_regs)
+        else:
+            first_reg = 0
+            n_cols = 0
+        self.emit(Opcode.ResultRow, P1=first_reg, P2=n_cols, comment='RETURNING')
 
     # ── CTE ──
 
