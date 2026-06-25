@@ -27,7 +27,7 @@ class Database:
         self.pager = Pager(self.vfs, path)
         self.schema = Schema(self.pager)
         self.schema.load()
-        self.tx = TransactionManager(self.pager, self.vfs, self.pager.handle)
+        self.tx = TransactionManager(self.pager, self.vfs, self.pager.handle, schema=self.schema)
         self._custom_functions: dict[str, callable] = {}
         self._custom_aggregates: dict[str, callable] = {}
         self._busy_handler: callable | None = None
@@ -57,7 +57,8 @@ class Database:
         from pysqlite.parser import Parser
         from pysqlite.compile import Compiler
         from pysqlite.vm import VM
-        from pysqlite.ast import Insert, Update, Delete
+        from pysqlite.ast import Insert, Update, Delete, Begin, Commit, RollbackStmt
+        from pysqlite.transaction import TransactionState
 
         lexer = Lexer(sql)
         tokens = lexer.tokenize()
@@ -77,6 +78,8 @@ class Database:
             elif isinstance(stmt, Delete):
                 event = 'DELETE'
                 table_name = stmt.table.name if hasattr(stmt.table, 'name') else str(stmt.table)
+
+            was_in_tx = self.tx.state != TransactionState.NONE
 
             # Find matching triggers on this table
             before_triggers = []
@@ -111,6 +114,11 @@ class Database:
             for trig in after_triggers:
                 for prog in trig.programs:
                     vm.run(prog, params=params)
+
+            # Auto-commit implicit transactions (skip explicit tx control statements)
+            if not was_in_tx and self.tx.state != TransactionState.NONE \
+               and not isinstance(stmt, (Begin, Commit, RollbackStmt)):
+                self.tx.commit()
 
         return results if len(results) != 1 else results[0]
 

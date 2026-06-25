@@ -1117,6 +1117,7 @@ class Compiler:
         root_page = self.db.allocate_page() if self.db else 1
         sql = self._reconstruct_create_table_sql(node)
         from pysqlite.schema import ColumnDef as SchemaColumnDef
+        from pysqlite.ast import ColumnConstraint, TableConstraint, ForeignKey as AstForeignKey
         columns = []
         for col in node.columns:
             affinity = self.schema._determine_affinity(col.type_name)
@@ -1132,9 +1133,21 @@ class Compiler:
                 collation=self.schema._get_collation(col) if hasattr(self.schema, '_get_collation') else None,
             ))
         from pysqlite.schema import TableDef
+        foreign_keys = []
+        for col in node.columns:
+            for c in col.constraints:
+                if c.kind == 'REFERENCES' and isinstance(c.details, AstForeignKey):
+                    fk = c.details
+                    if not fk.columns:
+                        fk.columns = [col.name]
+                    foreign_keys.append(fk)
+        for tc in node.constraints:
+            if tc.kind == 'FOREIGN KEY' and isinstance(tc.details, AstForeignKey):
+                foreign_keys.append(tc.details)
         td = TableDef(
             name=node.name.name, root_page=root_page,
             columns=columns, constraints=node.constraints,
+            foreign_keys=foreign_keys,
             without_rowid=node.without_rowid, strict=node.strict,
             sql=sql,
         )
@@ -1167,7 +1180,19 @@ class Compiler:
                     col_sql += ' UNIQUE'
                 elif c.kind == 'DEFAULT' and c.details is not None:
                     col_sql += f' DEFAULT {c.details}'
+                elif c.kind == 'REFERENCES' and hasattr(c, 'details') and c.details:
+                    fk = c.details
+                    col_sql += f' REFERENCES {fk.table}'
+                    if fk.columns:
+                        col_sql += f' ({", ".join(fk.columns)})'
             col_parts.append(col_sql)
+        for tc in node.constraints:
+            if tc.kind == 'FOREIGN KEY' and hasattr(tc, 'details') and tc.details:
+                fk = tc.details
+                fk_sql = f'FOREIGN KEY ({", ".join(tc.columns)}) REFERENCES {fk.table}'
+                if fk.columns:
+                    fk_sql += f' ({", ".join(fk.columns)})'
+                col_parts.append(fk_sql)
         parts.append(', '.join(col_parts))
         parts.append(')')
         return ''.join(parts)

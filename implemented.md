@@ -115,6 +115,7 @@
 [x] 7.16 PRAGMAs (table_info, index_list, index_info, page_count, page_size, schema_version, user_version, application_id, freelist_count, encoding, database_list, compile_options, collation_list)
 [x] 7.17 Integrity check (PRAGMA integrity_check)
 [x] 7.18 ANALYZE (stub - no-op)
+[x] 7.19 FOREIGN KEY enforcement (parse + commit-time validation)
 ```
 
 ## Phase 8: CLI & Ecosystem

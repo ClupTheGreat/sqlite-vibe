@@ -332,10 +332,24 @@ class Schema:
                 auto_increment=self._has_autoinc(col_def),
                 collation=self._get_collation(col_def),
             ))
+        # Extract foreign keys from constraints
+        fk_list = []
+        for c in stmt.constraints:
+            if c.kind == 'FOREIGN KEY' and c.details:
+                fk_list.append(c.details)
+        # Extract column-level REFERENCES
+        for col_def in stmt.columns:
+            for cc in col_def.constraints:
+                if cc.kind == 'REFERENCES' and cc.details:
+                    fk = cc.details
+                    if not fk.columns:
+                        fk.columns = [col_def.name]
+                    fk_list.append(fk)
         return TableDef(
             name=name, root_page=rootpage, columns=columns,
             constraints=stmt.constraints,
             without_rowid=stmt.without_rowid, strict=stmt.strict,
+            foreign_keys=fk_list,
             sql=sql,
         )
 
