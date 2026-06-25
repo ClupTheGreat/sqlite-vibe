@@ -64,7 +64,7 @@ _KEYWORDS = {
     'CREATE': TokenType.CREATE, 'DROP': TokenType.DROP,
     'ALTER': TokenType.ALTER, 'TABLE': TokenType.TABLE,
     'INDEX': TokenType.INDEX, 'VIEW': TokenType.VIEW,
-    'TRIGGER': TokenType.TRIGGER, 'VIRTUAL': TokenType.VIRTUAL,
+    'TRIGGER': TokenType.TRIGGER, 'VIRTUAL': TokenType.VIRTUAL_KW,
     'SELECT': TokenType.SELECT, 'INSERT': TokenType.INSERT,
     'UPDATE': TokenType.UPDATE, 'DELETE': TokenType.DELETE,
     'INTO': TokenType.INTO, 'FROM': TokenType.FROM,

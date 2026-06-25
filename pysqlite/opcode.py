@@ -290,3 +290,6 @@ class Opcode:
     StrGlob = 'StrGlob'
     StrRegexp = 'StrRegexp'
     FkUpdate = 'FkUpdate'
+    Match = 'Match'
+    FtsBuildIndex = 'FtsBuildIndex'
+    FtsRemoveIndex = 'FtsRemoveIndex'

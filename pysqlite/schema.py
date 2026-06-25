@@ -150,6 +150,7 @@ class Schema:
         self.indexes: dict[str, IndexDef] = {}
         self.views: dict[str, ViewDef] = {}
         self.triggers: dict[str, TriggerDef] = {}
+        self.virtual_tables: dict[str, Any] = {}
         self.collations: dict[str, Collation] = {
             'BINARY': Collation('BINARY', _collation_binary),
             'NOCASE': Collation('NOCASE', _collation_nocase),

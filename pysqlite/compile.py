@@ -11,6 +11,7 @@ from pysqlite.ast import (
     Select, Insert, Update, Delete,
     CreateTable, CreateIndex, DropTable, DropIndex,
     CreateView, DropView, CreateTrigger, DropTrigger, AlterTable,
+    CreateVirtualTable,
     Begin, Commit, RollbackStmt, Savepoint, Release,
     Pragma, Explain, Analyze,
     Literal, NullLiteral, ColumnRef, UnaryOp, BinaryOp,
@@ -178,6 +179,8 @@ class Compiler:
             self._compile_create_trigger(statement)
         elif isinstance(statement, DropTrigger):
             self._compile_drop_trigger(statement)
+        elif isinstance(statement, CreateVirtualTable):
+            self._compile_create_virtual_table(statement)
         elif isinstance(statement, Explain):
             self._compile_explain(statement)
         elif isinstance(statement, Analyze):
@@ -530,6 +533,14 @@ class Compiler:
             self.define_label(true_label)
             self.emit(Opcode.Integer, P1=1, P2=reg, comment=f'{op} true')
             self.define_label(end_label)
+        elif op in ('MATCH', 'NOT MATCH'):
+            right_reg = self.compile_expr(expr.right, cursor)
+            table_name = None
+            if isinstance(expr.left, ColumnRef):
+                table_name = expr.left.table or expr.left.name
+            self.emit(Opcode.Match, P1=cursor, P2=right_reg, P3=reg,
+                      P4={'table': table_name, 'negate': op == 'NOT MATCH'},
+                      comment=f'fts5 {op}')
         else:
             raise CompilerError(f'Unsupported binary operator: {op}')
 
@@ -1057,12 +1068,17 @@ class Compiler:
             col_count = len(td.columns) if not node.columns else len(node.columns)
             is_upsert = node.on_conflict is not None or node.or_action in ('IGNORE', 'REPLACE')
             pk_info = self._get_pk_column(td) if is_upsert else None
+            # Determine which column is the exact INTEGER PRIMARY KEY (rowid alias) to skip from payload
+            rowid_alias_col = None
+            for ci in range(len(getattr(td, 'columns', []))):
+                if self._is_rowid_alias_column(td, ci):
+                    rowid_alias_col = ci
+                    break
             for row in node.values:
                 val_regs = []
                 for val in row:
                     vr = self.compile_expr(val, 0)
                     val_regs.append(vr)
-                # Expand generated column values before rowid (keeps val_regs contiguous)
                 n_user = len(val_regs)
                 if node.columns:
                     col_provided = {}
@@ -1074,8 +1090,15 @@ class Compiler:
                             pass
                 else:
                     col_provided = {vi: vi for vi in range(n_user)}
+                # Separate exact INTEGER PK (rowid alias) from user-provided values
+                pk_val_reg = None
+                if rowid_alias_col is not None and rowid_alias_col in col_provided:
+                    pk_vi = col_provided.pop(rowid_alias_col)
+                    pk_val_reg = val_regs[pk_vi]
                 gen_map = {}
                 for ci, col in enumerate(td.columns):
+                    if ci == rowid_alias_col:
+                        continue
                     if ci in col_provided:
                         gen_map[col.name.upper()] = val_regs[col_provided[ci]]
                     elif col.is_generated and col.generated_type == 'STORED':
@@ -1098,7 +1121,6 @@ class Compiler:
                                       comment='compact val')
                     val_regs = list(range(first, first + n_total))
                 rowid_reg = self.alloc_reg()
-                # For WITHOUT ROWID tables, use PK value as key (no NewRowid)
                 if td.without_rowid:
                     wr_pk = self._get_any_pk_column(td)
                     if wr_pk is not None:
@@ -1124,23 +1146,18 @@ class Compiler:
                     else:
                         self.emit(Opcode.Integer, P1=0, P2=rowid_reg, comment='default key')
                 elif pk_info:
-                    pk_idx, _ = pk_info
-                    if node.columns:
-                        mapped = -1
-                        for vi, col_name in enumerate(node.columns):
-                            try:
-                                ci = td.column_index(col_name)
-                                if ci == pk_idx:
-                                    mapped = vi
-                                    break
-                            except ValueError:
-                                pass
-                        pk_val_idx = mapped if mapped >= 0 else pk_idx
-                    else:
-                        pk_val_idx = pk_idx
-                    if pk_val_idx < len(val_regs):
-                        self.emit(Opcode.MemCopy, P1=val_regs[pk_val_idx], P2=rowid_reg,
+                    pk_idx = pk_info[0]
+                    if pk_val_reg is not None:
+                        self.emit(Opcode.MemCopy, P1=pk_val_reg, P2=rowid_reg,
                                   comment='PK value as rowid')
+                    elif pk_idx in col_provided:
+                        pk_vi = col_provided[pk_idx]
+                        if pk_vi < len(val_regs):
+                            self.emit(Opcode.MemCopy, P1=val_regs[pk_vi], P2=rowid_reg,
+                                      comment='PK value as rowid')
+                        else:
+                            self.emit(Opcode.NewRowid, P1=cursor, P2=0, P3=rowid_reg,
+                                      comment='new rowid')
                     else:
                         self.emit(Opcode.NewRowid, P1=cursor, P2=0, P3=rowid_reg,
                                   comment='new rowid')
@@ -1528,6 +1545,23 @@ class Compiler:
         self.emit(Opcode.Next, P1=cursor, P2=loop_start, comment='next row')
 
     # ── DDL ──
+
+    def _compile_create_virtual_table(self, node: CreateVirtualTable):
+        self.emit(Opcode.Transaction, P1=1, comment='DDL begin write')
+        sql = self._reconstruct_create_virtual_table_sql(node)
+        self.emit(Opcode.CreateTable, P1=0, P2=0, P4={
+            'type': 'virtual',
+            'name': node.name.name,
+            'module': node.module,
+            'args': node.args,
+            'sql': sql,
+        }, comment=f'CREATE VIRTUAL TABLE {node.name.name}')
+
+    @staticmethod
+    def _reconstruct_create_virtual_table_sql(node: CreateVirtualTable) -> str:
+        args = ', '.join(node.args)
+        if_not = ' IF NOT EXISTS' if node.if_not_exists else ''
+        return f'CREATE VIRTUAL TABLE{if_not} {node.name.name} USING {node.module}({args})'
 
     def _compile_create_table(self, node: CreateTable):
         self.emit(Opcode.Transaction, P1=1, comment='DDL begin write')
@@ -2225,12 +2259,26 @@ class Compiler:
                 ot.expr = self._rewrite_col_ref(ot.expr, composite_map, None)
 
     def _get_pk_column(self, td: 'TableDef') -> tuple[int, ColumnDef] | None:
-        """Find the single INTEGER PRIMARY KEY column, if any."""
+        """Find the single INTEGER PRIMARY KEY column (rowid alias), if any."""
         from pysqlite.schema import AFFINITY
         for i, col in enumerate(getattr(td, 'columns', [])):
             if col.primary_key and col.affinity == AFFINITY.INTEGER:
                 return i, col
         return None
+
+    def _is_rowid_alias_column(self, td: 'TableDef', col_idx: int) -> bool:
+        """Check if column at col_idx is an exact INTEGER PRIMARY KEY (rowid alias).
+        SQLite: only exact 'INTEGER' type name creates a rowid alias.
+        """
+        cols = getattr(td, 'columns', [])
+        if col_idx < 0 or col_idx >= len(cols):
+            return False
+        col = cols[col_idx]
+        if not col.primary_key:
+            return False
+        if col.type_name is not None and col.type_name.name.upper() == 'INTEGER':
+            return True
+        return False
 
     def _get_any_pk_column(self, td: 'TableDef') -> tuple[int, ColumnDef] | None:
         """Find the first PRIMARY KEY column (any type)."""

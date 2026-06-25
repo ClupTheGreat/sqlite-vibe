@@ -56,6 +56,7 @@ class Cursor:
     strict: bool = False
     col_types: list[str] | None = None  # for STRICT validation
     without_rowid: bool = False
+    int_pk_col_idx: int = -1  # column index of INTEGER PRIMARY KEY, -1 = none
 
     @property
     def root_page(self) -> int:
@@ -262,6 +263,19 @@ class VM:
 
     # ── Cursor Operations ──
 
+    def _set_cursor_int_pk(self, c: Cursor, root_page: int):
+        """Look up INTEGER PRIMARY KEY (rowid alias) column from schema using root_page.
+        Only exact 'INTEGER' type name creates a rowid alias in SQLite.
+        """
+        if self.tx and self.tx.schema and root_page > 0:
+            for td in self.tx.schema.tables.values():
+                if td.root_page == root_page:
+                    for i, col in enumerate(td.columns):
+                        if col.primary_key and col.type_name is not None \
+                           and col.type_name.name.upper() == 'INTEGER':
+                            c.int_pk_col_idx = i
+                            return
+
     def _op_OpenRead(self, P1: int, P2: int, P3: int, P4: Any, P5: int):
         without_rowid = isinstance(P4, dict) and P4.get('without_rowid', False)
         btree = BTree(self.pager, P2, is_table=not without_rowid)
@@ -270,6 +284,7 @@ class VM:
         if isinstance(P4, dict):
             c.strict = P4.get('strict', False)
             c.col_types = P4.get('col_types')
+        self._set_cursor_int_pk(c, P2)
         self.cursors[P1] = c
 
     def _op_OpenWrite(self, P1: int, P2: int, P3: int, P4: Any, P5: int):
@@ -280,6 +295,7 @@ class VM:
         if isinstance(P4, dict):
             c.strict = P4.get('strict', False)
             c.col_types = P4.get('col_types')
+        self._set_cursor_int_pk(c, P2)
         self.cursors[P1] = c
 
     def _op_OpenEphemeral(self, P1: int, P2: int, P3: int, P4: Any, P5: int):
@@ -358,6 +374,14 @@ class VM:
         if c is None or c.eof:
             self._set_reg(P3, Register())
             return
+        # Handle INTEGER PRIMARY KEY: stored in key, not payload
+        if c.int_pk_col_idx >= 0:
+            if P2 == c.int_pk_col_idx:
+                key = c.cursor.current_key()
+                self._set_reg(P3, Register(RegisterType.INT, key))
+                return
+            elif P2 > c.int_pk_col_idx:
+                P2 = P2 - 1
         payload = c.cursor.current_payload()
         try:
             record, _ = Record.decode(payload)
@@ -672,6 +696,21 @@ class VM:
         import fnmatch
         match = fnmatch.fnmatch(text, pattern)
         self._set_reg(P3, Register(RegisterType.INT, 1 if match else 0))
+
+    def _op_Match(self, P1: int, P2: int, P3: int, P4: Any, P5: int):
+        query = str(self._reg(P2).value or '')
+        table_name = P4.get('table') if isinstance(P4, dict) else None
+        negate = P4.get('negate', False) if isinstance(P4, dict) else False
+        matched = False
+        if table_name and hasattr(self, 'pager') and self.pager:
+            schema = getattr(self.pager, '_schema', None)
+            if schema:
+                from pysqlite.virtualtables import get_virtual_table
+                vt = get_virtual_table(table_name, schema)
+                if vt and hasattr(vt, 'match_row'):
+                    docid = self._reg(P1).value if P1 in self.registers else 0
+                    matched = vt.match_row(docid, query)
+        self._set_reg(P3, Register(RegisterType.INT, 1 if (matched ^ negate) else 0))
 
     # ── I/O ──
 

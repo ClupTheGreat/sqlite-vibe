@@ -57,8 +57,14 @@ class Database:
         from pysqlite.parser import Parser
         from pysqlite.compile import Compiler
         from pysqlite.vm import VM
-        from pysqlite.ast import Insert, Update, Delete, Begin, Commit, RollbackStmt
+        from pysqlite.ast import (
+            Insert, Update, Delete, Begin, Commit, RollbackStmt,
+            Select, CreateVirtualTable, CreateTable, DropTable,
+            Literal, ColumnRef, BinaryOp,
+        )
         from pysqlite.transaction import TransactionState
+        from pysqlite.virtualtables import create_virtual_table, drop_virtual_table
+        from pysqlite.virtualtables import get_virtual_table
 
         lexer = Lexer(sql)
         tokens = lexer.tokenize()
@@ -78,6 +84,72 @@ class Database:
             elif isinstance(stmt, Delete):
                 event = 'DELETE'
                 table_name = stmt.table.name if hasattr(stmt.table, 'name') else str(stmt.table)
+            elif isinstance(stmt, Select) and stmt.from_clause:
+                tbl = stmt.from_clause[0]
+                table_name = tbl.name if hasattr(tbl, 'name') else str(tbl)
+
+            # ── Handle CREATE VIRTUAL TABLE ──
+            if isinstance(stmt, CreateVirtualTable):
+                col_names = [a for a in stmt.args if not a.startswith('tokenize=')]
+                content_cols = ', '.join(f'{c} TEXT' for c in col_names)
+                content_sql = f'CREATE TABLE {stmt.name.name}_content (docid INTEGER PRIMARY KEY, {content_cols})'
+                self.execute(content_sql)
+                vt = create_virtual_table(stmt.name.name, stmt.module, stmt.args, self.schema)
+                self.tx.commit()
+                results.append(QueryResult([[0]]))
+                continue
+
+            # Handle SELECT on FTS5 tables with MATCH
+            vt_name = table_name.upper() if table_name else None
+            vt = self.schema.virtual_tables.get(vt_name) if vt_name else None
+
+            if vt and isinstance(stmt, Select):
+                col_names = vt.columns
+                cols_sql = ', '.join(col_names)
+                if stmt.where:
+                    match_docids = self._handle_fts5_match(stmt.where, vt)
+                    if match_docids is not None:
+                        if match_docids:
+                            ids_str = ', '.join(str(d) for d in sorted(match_docids))
+                            final_sql = f'SELECT {cols_sql} FROM {vt.name}_content WHERE docid IN ({ids_str})'
+                            result = self.execute(final_sql)
+                            results.append(result if isinstance(result, QueryResult) else QueryResult())
+                            continue
+                        else:
+                            results.append(QueryResult())
+                            continue
+                # No MATCH or no WHERE — full scan
+                final_sql = f'SELECT {cols_sql} FROM {vt.name}_content'
+                result = self.execute(final_sql)
+                results.append(result if isinstance(result, QueryResult) else QueryResult())
+                continue
+
+            # Handle INSERT on FTS5 tables
+            if vt and isinstance(stmt, Insert):
+                col_names = vt.columns
+                for row in (stmt.values or []):
+                    vals = []
+                    for v in row:
+                        if isinstance(v, Literal):
+                            val = v.value
+                        else:
+                            val = str(v)
+                        if isinstance(val, str):
+                            vals.append(f"'{val}'")
+                        elif val is None:
+                            vals.append('NULL')
+                        else:
+                            vals.append(str(val))
+                    lit_sql = ', '.join(vals)
+                    cols_sql = ', '.join(col_names)
+                    content_sql = f'INSERT INTO {vt.name}_content ({cols_sql}) VALUES ({lit_sql})'
+                    self.execute(content_sql)
+                    docid = getattr(self.tx, '_last_rowid', 0)
+                    if docid:
+                        actual_vals = [v.value if isinstance(v, Literal) else str(v) for v in row]
+                        vt.insert(docid, actual_vals)
+                results.append(QueryResult([[0]]))
+                continue
 
             was_in_tx = self.tx.state != TransactionState.NONE
 
@@ -109,6 +181,7 @@ class Database:
             # Run main statement
             rows = vm.run(program, params=params)
             results.append(QueryResult(rows, columns=columns))
+            self.tx._last_rowid = vm.last_rowid
 
             # Run AFTER triggers
             for trig in after_triggers:
@@ -121,6 +194,23 @@ class Database:
                 self.tx.commit()
 
         return results if len(results) != 1 else results[0]
+
+    def _handle_fts5_match(self, where_expr, vt) -> set | None:
+        """Extract MATCH query from WHERE expression and evaluate.
+        Returns set of docids or None if no MATCH found."""
+        from pysqlite.ast import BinaryOp
+        if isinstance(where_expr, BinaryOp) and where_expr.op == 'MATCH':
+            right = where_expr.right
+            query = right.value if hasattr(right, 'value') else str(right)
+            if hasattr(vt, 'match'):
+                return vt.match(str(query))
+        elif isinstance(where_expr, BinaryOp) and where_expr.op == 'AND':
+            left_set = self._handle_fts5_match(where_expr.left, vt)
+            right_set = self._handle_fts5_match(where_expr.right, vt)
+            if left_set is not None and right_set is not None:
+                return left_set & right_set
+            return left_set or right_set
+        return None
 
     def close(self):
         if self.pager.handle:

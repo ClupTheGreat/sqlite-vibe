@@ -147,7 +147,7 @@ class Parser:
             return self._parse_create_view(temp)
         if tt == TokenType.TRIGGER:
             return self._parse_create_trigger()
-        if tt == TokenType.VIRTUAL:
+        if tt == TokenType.VIRTUAL_KW:
             return self._parse_create_virtual_table()
         raise ParseError(f"Expected TABLE/INDEX/VIEW/TRIGGER/VIRTUAL after CREATE")
 
@@ -456,6 +456,7 @@ class Parser:
                              for_each_row=for_each_row, when=when)
 
     def _parse_create_virtual_table(self) -> CreateVirtualTable:
+        self.advance()  # past VIRTUAL
         if self.peek() == TokenType.TABLE:
             self.advance()
         if_not_exists = False
@@ -469,7 +470,9 @@ class Parser:
         args = []
         if self.match(TokenType.LPAREN):
             while self.peek() != TokenType.RPAREN:
-                args.append(self.advance().value)
+                tok = self.advance()
+                if tok.type != TokenType.COMMA:
+                    args.append(tok.value)
             self.expect(TokenType.RPAREN)
         return CreateVirtualTable(name=name, module=module, args=args,
                                   if_not_exists=if_not_exists)
@@ -1056,6 +1059,7 @@ class Parser:
                         escape = self._parse_expr_between()
                     return BinaryOp('NOT GLOB', left, right)
                 elif self.peek() == TokenType.MATCH:
+                    self.advance()
                     right = self._parse_expr_between()
                     return BinaryOp('NOT MATCH', left, right)
                 elif self.peek() == TokenType.REGEXP:
@@ -1072,6 +1076,7 @@ class Parser:
                     escape = self._parse_expr_between()
                 return BinaryOp('GLOB', left, right)
             elif self.peek() == TokenType.MATCH:
+                self.advance()
                 right = self._parse_expr_between()
                 return BinaryOp('MATCH', left, right)
             elif self.peek() == TokenType.REGEXP:
