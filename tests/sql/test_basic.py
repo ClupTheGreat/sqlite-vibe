@@ -583,6 +583,20 @@ class TestUpsert:
         assert res == [[1, 'hello'], [2, 'new']]
 
 
+class TestStrict:
+    def test_strict_valid_insert(self, db):
+        db.execute("CREATE TABLE t (a INT, b TEXT) STRICT")
+        db.execute("INSERT INTO t VALUES (1, 'hello')")
+        res = db.execute('SELECT * FROM t')
+        assert res == [[1, 'hello']]
+
+    def test_strict_rejects_wrong_type(self, db):
+        db.execute("CREATE TABLE t (a INT, b TEXT) STRICT")
+        import pytest
+        with pytest.raises(Exception, match='STRICT table'):
+            db.execute("INSERT INTO t VALUES ('not_int', 'hello')")
+
+
 class TestParameterBinding:
     def test_named_param(self, db):
         db.execute('CREATE TABLE t (a INT, b TEXT)')

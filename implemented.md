@@ -105,11 +105,11 @@
 [ ] 7.6 JSON functions (json_extract, json_set, json_array, etc.)
 [ ] 7.7 Window functions (ROW_NUMBER, RANK, LAG, LEAD, NTILE, etc.)
 [x] 7.8 Views (CREATE/DROP, expansion with column rewriting)
-[ ] 7.9 Triggers (BEFORE/AFTER/INSTEAD OF, OLD/NEW)
-[x] 7.10 UPSERT (ON CONFLICT DO NOTHING + INSERT OR IGNORE)
+[-] 7.9 Triggers (BEFORE/AFTER/INSTEAD OF, OLD/NEW — parser + schema only, no VM execution)
+[x] 7.10 UPSERT (ON CONFLICT DO NOTHING/UPDATE + INSERT OR IGNORE)
 [x] 7.11 RETURNING clause (INSERT/UPDATE/DELETE with SeekRowid + ResultRow)
 [ ] 7.12 WITHOUT ROWID tables
-[ ] 7.13 STRICT tables
+[x] 7.13 STRICT tables (type enforcement on INSERT)
 [ ] 7.14 Generated columns (VIRTUAL/STORED)
 [ ] 7.15 Full-text search (FTS5)
 [x] 7.16 PRAGMAs (table_info, index_list, index_info, page_count, page_size, schema_version, user_version, application_id, freelist_count, encoding, database_list, compile_options, collation_list)
@@ -120,19 +120,19 @@
 ## Phase 8: CLI & Ecosystem
 
 ```
+[x] 8.1 CLI REPL (prompt, multi-line, history)
+[x] 8.2 Dot commands (.tables, .schema, .dump, .import, .output, .excel, etc.)
+[x] 8.3 Output modes (list, column, csv, json, markdown, box, insert)
 [x] 8.4 Python DB-API 2.0 (connect, cursor, execute, fetch) — Database class
-[ ] 8.1 CLI REPL (prompt, multi-line, history)
-[ ] 8.2 Dot commands (.tables, .schema, .dump, .import, etc.)
-[ ] 8.3 Output modes (list, column, csv, json, markdown, box, insert)
-[ ] 8.5 Parameter binding (?, :name, @name, $name)
-[ ] 8.6 Custom function/aggregate/collation registration
+[x] 8.5 Parameter binding (?, ?NNN, :name, @name, $name)
+[x] 8.6 Custom function/aggregate/collation registration (create_function, create_aggregate)
 ```
 
 ## Phase 9: Testing
 
 ```
-[ ] 9.1 Unit tests (all modules)
-[x] 9.2 SQL integration tests (73 end-to-end tests: DDL, DML, SELECT, expressions, ORDER BY, functions, aggregation, GROUP BY, HAVING, math, date/time, views, transactions)
+[x] 9.1 Unit tests (13 test modules: bitwise, cell, btree, pager, record, schema, lexer, parser, compile, vm, vfs, transaction, errors)
+[x] 9.2 SQL integration tests (106 end-to-end tests: DDL, DML, SELECT, expressions, ORDER BY, functions, aggregation, GROUP BY, HAVING, math, date/time, views, upsert, strict, parameter binding, transactions)
 [ ] 9.3 Compatibility tests (against real sqlite3)
 [ ] 9.4 Stress tests (large data, transactions)
 [ ] 9.5 Fuzz tests (random SQL, corrupt DB)

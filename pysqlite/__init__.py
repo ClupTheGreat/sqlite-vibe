@@ -28,6 +28,16 @@ class Database:
         self.schema = Schema(self.pager)
         self.schema.load()
         self.tx = TransactionManager(self.pager, self.vfs, self.pager.handle)
+        self._custom_functions: dict[str, callable] = {}
+        self._custom_aggregates: dict[str, callable] = {}
+
+    def create_function(self, name: str, nargs: int, func: callable, *, deterministic: bool = False):
+        """Register a custom scalar function."""
+        self._custom_functions[name.upper()] = func
+
+    def create_aggregate(self, name: str, nargs: int, aggregate_class: type):
+        """Register a custom aggregate class (must have step() and final() methods)."""
+        self._custom_aggregates[name.upper()] = aggregate_class
 
     def execute(self, sql: str):
         return self.execute_params(sql)
@@ -45,10 +55,13 @@ class Database:
 
         results = []
         for stmt in statements:
-            compiler = Compiler(self.schema, self.pager)
+            compiler = Compiler(self.schema, self.pager,
+                                custom_aggregates=set(self._custom_aggregates.keys()))
             program = compiler.compile(stmt)
             columns = compiler.result_columns
-            vm = VM(self.pager, self.tx)
+            vm = VM(self.pager, self.tx,
+                    custom_functions=self._custom_functions,
+                    custom_aggregates=self._custom_aggregates)
             rows = vm.run(program, params=params)
             results.append(QueryResult(rows, columns=columns))
 

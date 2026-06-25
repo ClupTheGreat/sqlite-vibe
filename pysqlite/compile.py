@@ -26,6 +26,11 @@ from pysqlite.ast import (
 
 AGGREGATE_FUNCTIONS = frozenset({'COUNT', 'SUM', 'AVG', 'MIN', 'MAX', 'GROUP_CONCAT', 'TOTAL'})
 
+def _is_aggregate_name(name: str, custom_aggregates: set[str] | None = None) -> bool:
+    return name.upper() in AGGREGATE_FUNCTIONS or (
+        custom_aggregates is not None and name.upper() in custom_aggregates
+    )
+
 
 # ── Compiler ──
 
@@ -34,9 +39,10 @@ class CompilerError(Exception):
 
 
 class Compiler:
-    def __init__(self, schema, db=None):
+    def __init__(self, schema, db=None, custom_aggregates: set[str] | None = None):
         self.schema = schema
         self.db = db
+        self.custom_aggregates = custom_aggregates or set()
         self.instructions: list[Instruction] = []
         self.labels: dict[str, int] = {}
         self.pending_labels: dict[str, list[int]] = {}
@@ -183,15 +189,24 @@ class Compiler:
 
     # ── Aggregate detection ──
 
+    @property
+    def _aggregate_names(self) -> frozenset:
+        return frozenset(AGGREGATE_FUNCTIONS | self.custom_aggregates)
+
     @staticmethod
     def _is_aggregate(expr: Expr) -> bool:
         return isinstance(expr, FunctionCall) and expr.name.upper() in AGGREGATE_FUNCTIONS
+
+    def _is_aggregate_expr(self, expr: Expr) -> bool:
+        return self._is_aggregate(expr) or (
+            isinstance(expr, FunctionCall) and expr.name.upper() in self.custom_aggregates
+        )
 
     def _has_aggregates(self, node: Select) -> bool:
         if node.group_by:
             return True
         for rc in node.columns:
-            if self._is_aggregate(rc.expr):
+            if self._is_aggregate_expr(rc.expr):
                 return True
         return False
 
@@ -209,7 +224,8 @@ class Compiler:
         elif isinstance(expr, UnaryOp):
             return (expr.op, self._serialize_having(expr.operand, aggs))
         elif isinstance(expr, FunctionCall):
-            if expr.name.upper() in AGGREGATE_FUNCTIONS:
+            all_aggs = AGGREGATE_FUNCTIONS | self.custom_aggregates
+            if expr.name.upper() in all_aggs:
                 for i, a in enumerate(aggs):
                     if a['name'] == expr.name.upper() and a.get('star') == expr.star:
                         return ('agg_result', i)
@@ -297,7 +313,7 @@ class Compiler:
                           P4=n_args, comment='GLOB')
             elif func == 'COUNT' and expr.star:
                 self.emit(Opcode.Count, P1=reg, comment='COUNT(*)')
-            elif func in AGGREGATE_FUNCTIONS:
+            elif func in AGGREGATE_FUNCTIONS or func in self.custom_aggregates:
                 self.emit(Opcode.Aggregate, P1=reg, P4={'name': func, 'star': expr.star, 'args': arg_regs},
                           comment=f'aggregate {func}')
             elif func in ('ABS', 'UPPER', 'LOWER', 'LENGTH', 'SUBSTR'):
@@ -661,7 +677,7 @@ class Compiler:
         self.result_columns = []
 
         for rc in node.columns:
-            if self._is_aggregate(rc.expr):
+            if self._is_aggregate_expr(rc.expr):
                 func = rc.expr
                 if func.star:
                     dummy = self.alloc_reg()
@@ -746,8 +762,11 @@ class Compiler:
         cursor = self.alloc_cursor()
         self.cursor_table[cursor] = td
         self.emit(Opcode.Transaction, P1=1, comment='begin write')
+        table_info = None
+        if td.strict:
+            table_info = {'strict': True, 'col_types': [c.type_name.name if c.type_name else 'BLOB' for c in td.columns]}
         self.emit(Opcode.OpenWrite, P1=cursor, P2=td.root_page,
-                  P3=len(td.columns), comment=f'open {td.name}')
+                  P3=len(td.columns), P4=table_info, comment=f'open {td.name}')
 
         if node.default_values:
             rowid_reg = self.alloc_reg()
@@ -996,8 +1015,11 @@ class Compiler:
         cursor = self.alloc_cursor()
         self.cursor_table[cursor] = td
         self.emit(Opcode.Transaction, P1=1, comment='begin write')
+        table_info = None
+        if td.strict:
+            table_info = {'strict': True, 'col_types': [c.type_name.name if c.type_name else 'BLOB' for c in td.columns]}
         self.emit(Opcode.OpenWrite, P1=cursor, P2=td.root_page,
-                  P3=len(td.columns), comment=f'open {td.name}')
+                  P3=len(td.columns), P4=table_info, comment=f'open {td.name}')
         self.emit(Opcode.Rewind, P1=cursor, P2=0, comment='rewind')
 
         loop_start = len(self.instructions)

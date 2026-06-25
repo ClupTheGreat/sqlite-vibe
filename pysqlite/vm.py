@@ -53,6 +53,8 @@ class Cursor:
     eof: bool = False
     bof: bool = True
     row: list[Register] | None = None
+    strict: bool = False
+    col_types: list[str] | None = None  # for STRICT validation
 
     @property
     def root_page(self) -> int:
@@ -64,7 +66,7 @@ class VmError(DatabaseError):
 
 
 class VM:
-    def __init__(self, pager, tx=None):
+    def __init__(self, pager, tx=None, custom_functions=None, custom_aggregates=None):
         self.pager = pager
         self.tx = tx
         self.program: list[Instruction] = []
@@ -77,12 +79,15 @@ class VM:
         self.changes: int = 0
         self.compare_flags: int = 0
         self.agg_accumulators: dict[int, list] = {}
+        self.agg_instances: dict[int, Any] = {}
         self.sub_return_stack: list[int] = []
         self.explain_mode: bool = False
         self._current_row: list[Register] = []
         self._affinity_cache: dict[str, int] = {}
         self.sort_spec: list[tuple[int, bool]] = []
         self.agg_spec: dict | None = None
+        self.custom_functions: dict[str, callable] = custom_functions or {}
+        self.custom_aggregates: dict[str, type] = custom_aggregates or {}
         if self.tx is None:
             from pysqlite.transaction import TransactionManager
             self.tx = TransactionManager(self.pager, self.pager.vfs, self.pager.handle)
@@ -259,12 +264,20 @@ class VM:
     def _op_OpenRead(self, P1: int, P2: int, P3: int, P4: Any, P5: int):
         btree = BTree(self.pager, P2, is_table=True)
         cursor = btree.cursor()
-        self.cursors[P1] = Cursor(btree=btree, cursor=cursor)
+        c = Cursor(btree=btree, cursor=cursor)
+        if isinstance(P4, dict):
+            c.strict = P4.get('strict', False)
+            c.col_types = P4.get('col_types')
+        self.cursors[P1] = c
 
     def _op_OpenWrite(self, P1: int, P2: int, P3: int, P4: Any, P5: int):
         btree = BTree(self.pager, P2, is_table=True)
         cursor = btree.cursor()
-        self.cursors[P1] = Cursor(btree=btree, cursor=cursor, is_writable=True)
+        c = Cursor(btree=btree, cursor=cursor, is_writable=True)
+        if isinstance(P4, dict):
+            c.strict = P4.get('strict', False)
+            c.col_types = P4.get('col_types')
+        self.cursors[P1] = c
 
     def _op_OpenEphemeral(self, P1: int, P2: int, P3: int, P4: Any, P5: int):
         from pysqlite.pager import Pager
@@ -694,6 +707,20 @@ class VM:
         if not isinstance(payload, bytes):
             self.error = 'Invalid record for insert'
             return
+        if c.strict and c.col_types:
+            rec, _ = Record.decode(payload)
+            vals = rec.get_values()
+            for i, (val, col_type) in enumerate(zip(vals, c.col_types)):
+                if col_type and val is not None:
+                    if col_type.upper() == 'TEXT' and not isinstance(val, str):
+                        self.error = f'STRICT table: expected TEXT for column {i}, got {type(val).__name__}'
+                        return
+                    if col_type.upper() in ('INTEGER', 'INT') and not isinstance(val, int):
+                        self.error = f'STRICT table: expected INTEGER for column {i}, got {type(val).__name__}'
+                        return
+                    if col_type.upper() == 'REAL' and not isinstance(val, (float, int)):
+                        self.error = f'STRICT table: expected REAL for column {i}, got {type(val).__name__}'
+                        return
         rowid = self._reg(P3).value if P3 in self.registers else 0
         if not isinstance(rowid, int):
             rowid = 0
@@ -778,6 +805,8 @@ class VM:
 
     def _call_function(self, name: str, args: list) -> Any:
         name_upper = name.upper()
+        if name_upper in self.custom_functions:
+            return self.custom_functions[name_upper](*args)
         if name_upper == 'ABS':
             return abs(args[0]) if args else 0
         if name_upper in ('COALESCE', 'IFNULL'):
@@ -1026,15 +1055,27 @@ class VM:
         for i in range(P3):
             reg = self._reg(P2 + i)
             args.append(reg.value)
-        if P1 not in self.agg_accumulators:
-            self.agg_accumulators[P1] = []
-        self.agg_accumulators[P1].append(args)
-
-    def _op_AggFinal(self, P1: int, P2: int, P3: int, P4: Any, P5: int):
-        acc = self.agg_accumulators.get(P1, [])
-        import sqlite3
         func_name = str(P4) if P4 else ''
         name_upper = func_name.upper()
+        if name_upper in self.custom_aggregates:
+            if P1 not in self.agg_instances:
+                self.agg_instances[P1] = self.custom_aggregates[name_upper]()
+            agg = self.agg_instances[P1]
+            agg.step(*args) if hasattr(agg, 'step') else None
+        else:
+            if P1 not in self.agg_accumulators:
+                self.agg_accumulators[P1] = []
+            self.agg_accumulators[P1].append(args)
+
+    def _op_AggFinal(self, P1: int, P2: int, P3: int, P4: Any, P5: int):
+        func_name = str(P4) if P4 else ''
+        name_upper = func_name.upper()
+        if name_upper in self.custom_aggregates:
+            agg = self.agg_instances.get(P1)
+            result = agg.final() if agg and hasattr(agg, 'final') else None
+            self._set_reg(P3, make_register(result))
+            return
+        acc = self.agg_accumulators.get(P1, [])
         result = None
         if name_upper == 'COUNT':
             result = len(acc) if acc else 0
@@ -1070,6 +1111,7 @@ class VM:
 
     def _op_AggReset(self, P1: int, P2: int, P3: int, P4: Any, P5: int):
         self.agg_accumulators.clear()
+        self.agg_instances.clear()
 
     def _op_AggValue(self, P1: int, P2: int, P3: int, P4: Any, P5: int):
         pass
@@ -1251,9 +1293,14 @@ class VM:
             return None
         return None
 
-    @staticmethod
-    def _compute_aggregate(name: str, values: list, star: bool = False):
+    def _compute_aggregate(self, name: str, values: list, star: bool = False):
         name_upper = name.upper()
+        if name_upper in self.custom_aggregates:
+            agg_cls = self.custom_aggregates[name_upper]
+            instance = agg_cls()
+            for v in values:
+                instance.step(v) if hasattr(instance, 'step') else None
+            return instance.final() if hasattr(instance, 'final') else None
         if name_upper == 'COUNT':
             if star:
                 return len(values)
