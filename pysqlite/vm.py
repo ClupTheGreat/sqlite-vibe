@@ -554,9 +554,12 @@ class VM:
         if a.type == RegisterType.NULL or b.type == RegisterType.NULL:
             self._set_reg(P2 if P2 > 0 else P1, Register())
             return
-        va = float(a.value) if a.type in (RegisterType.INT, RegisterType.REAL) else 0
-        vb = float(b.value) if b.type in (RegisterType.INT, RegisterType.REAL) else 0
-        result = va - vb
+        va = a.value if a.type == RegisterType.INT else (float(a.value) if a.type == RegisterType.REAL else 0)
+        vb = b.value if b.type == RegisterType.INT else (float(b.value) if b.type == RegisterType.REAL else 0)
+        if isinstance(va, int) and isinstance(vb, int):
+            result = va - vb
+        else:
+            result = float(va) - float(vb)
         self._set_reg(P2 if P2 > 0 else P1, make_register(result))
 
     def _op_Multiply(self, P1: int, P2: int, P3: int, P4: Any, P5: int):

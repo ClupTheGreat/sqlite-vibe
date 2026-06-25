@@ -591,6 +591,11 @@ class Compiler:
         if col_regs:
             first_reg = min(col_regs)
             n_cols = len(col_regs)
+            # Compact registers to be contiguous
+            for i, reg in enumerate(col_regs):
+                if reg != first_reg + i:
+                    self.emit(Opcode.MemCopy, P1=reg, P2=first_reg + i,
+                              comment='compact column')
         else:
             first_reg = 0
             n_cols = 0
@@ -723,7 +728,13 @@ class Compiler:
         self.emit(Opcode.Aggregate, P1=0, P4=agg_spec, comment='aggregation spec')
 
         if col_regs:
-            self.emit(Opcode.ResultRow, P1=min(col_regs), P2=len(col_regs),
+            first_col_reg = min(col_regs)
+            # Compact registers to be contiguous
+            for i, reg in enumerate(col_regs):
+                if reg != first_col_reg + i:
+                    self.emit(Opcode.MemCopy, P1=reg, P2=first_col_reg + i,
+                              comment='compact column')
+            self.emit(Opcode.ResultRow, P1=first_col_reg, P2=len(col_regs),
                       comment='emit row')
 
         if where_skip:
@@ -1509,6 +1520,10 @@ class Compiler:
         if col_regs:
             first_reg = min(col_regs)
             n_cols = len(col_regs)
+            for i, reg in enumerate(col_regs):
+                if reg != first_reg + i:
+                    self.emit(Opcode.MemCopy, P1=reg, P2=first_reg + i,
+                              comment='compact returning column')
         else:
             first_reg = 0
             n_cols = 0
