@@ -651,6 +651,22 @@ class VM:
     # ── Data modification ──
 
     def _op_Insert(self, P1: int, P2: int, P3: int, P4: Any, P5: int):
+        self._do_insert(P1, P2, P3)
+
+    def _op_NoConflictInsert(self, P1: int, P2: int, P3: int, P4: Any, P5: int):
+        c = self.cursors.get(P1)
+        if c is None:
+            self.error = 'Cursor not found'
+            return
+        rowid = self._reg(P3).value if P3 in self.registers else 0
+        if not isinstance(rowid, int):
+            rowid = 0
+        found = c.cursor.seek(rowid)
+        if found:
+            return  # Conflict - do nothing
+        self._do_insert(P1, P2, P3)
+
+    def _do_insert(self, P1, P2, P3):
         c = self.cursors.get(P1)
         if c is None:
             self.error = 'Cursor not found'

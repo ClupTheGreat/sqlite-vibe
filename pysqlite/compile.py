@@ -737,20 +737,50 @@ class Compiler:
             self._compile_insert_select(node.select, cursor, td, node.returning)
         elif node.values:
             col_count = len(td.columns) if not node.columns else len(node.columns)
+            is_upsert = node.on_conflict is not None or node.or_action in ('IGNORE', 'REPLACE')
+            pk_info = self._get_pk_column(td) if is_upsert else None
             for row in node.values:
                 val_regs = []
                 for val in row:
                     vr = self.compile_expr(val, 0)
                     val_regs.append(vr)
                 rowid_reg = self.alloc_reg()
-                self.emit(Opcode.NewRowid, P1=cursor, P2=0, P3=rowid_reg,
-                          comment='new rowid')
+                # For INTEGER PRIMARY KEY with UPSERT, use PK value as rowid
+                if pk_info:
+                    pk_idx, _ = pk_info
+                    if node.columns:
+                        mapped = -1
+                        for vi, col_name in enumerate(node.columns):
+                            try:
+                                ci = td.column_index(col_name)
+                                if ci == pk_idx:
+                                    mapped = vi
+                                    break
+                            except ValueError:
+                                pass
+                        pk_val_idx = mapped if mapped >= 0 else pk_idx
+                    else:
+                        pk_val_idx = pk_idx
+                    if pk_val_idx < len(val_regs):
+                        self.emit(Opcode.MemCopy, P1=val_regs[pk_val_idx], P2=rowid_reg,
+                                  comment='PK value as rowid')
+                    else:
+                        self.emit(Opcode.NewRowid, P1=cursor, P2=0, P3=rowid_reg,
+                                  comment='new rowid')
+                else:
+                    self.emit(Opcode.NewRowid, P1=cursor, P2=0, P3=rowid_reg,
+                              comment='new rowid')
                 first_val = val_regs[0] if val_regs else self.reg_null
                 record_reg = self.alloc_reg()
                 self.emit(Opcode.MakeRecord, P1=first_val, P2=len(val_regs),
                           P3=record_reg, comment='make record')
-                self.emit(Opcode.Insert, P1=cursor, P2=record_reg, P3=rowid_reg,
-                          comment='insert row')
+                use_no_conflict = (node.on_conflict is not None and node.on_conflict.action == 'NOTHING') or node.or_action == 'IGNORE'
+                if use_no_conflict:
+                    self.emit(Opcode.NoConflictInsert, P1=cursor, P2=record_reg, P3=rowid_reg,
+                              comment='insert or ignore')
+                else:
+                    self.emit(Opcode.Insert, P1=cursor, P2=record_reg, P3=rowid_reg,
+                              comment='insert row')
                 if node.returning:
                     self.emit(Opcode.SeekRowid, P1=cursor, P2=0, P3=rowid_reg,
                               comment='seek to inserted row for RETURNING')
@@ -1475,6 +1505,14 @@ class Compiler:
         if node.order_by:
             for ot in node.order_by:
                 ot.expr = self._rewrite_col_ref(ot.expr, composite_map, None)
+
+    def _get_pk_column(self, td: 'TableDef') -> tuple[int, ColumnDef] | None:
+        """Find the single INTEGER PRIMARY KEY column, if any."""
+        from pysqlite.schema import AFFINITY
+        for i, col in enumerate(getattr(td, 'columns', [])):
+            if col.primary_key and col.affinity == AFFINITY.INTEGER:
+                return i, col
+        return None
 
     # ── Schema lookups ──
 

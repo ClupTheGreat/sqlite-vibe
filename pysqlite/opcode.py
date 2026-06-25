@@ -39,6 +39,7 @@ class Opcode:
     IdxSeekGE = 'IdxSeekGE'
     IdxSeekLT = 'IdxSeekLT'
     IdxSeekLE = 'IdxSeekLE'
+    NoConflictInsert = 'NoConflictInsert'
     IdxInsert = 'IdxInsert'
     IdxDelete = 'IdxDelete'
     IdxRowid = 'IdxRowid'

@@ -528,6 +528,39 @@ class TestReturning:
         assert res == [[10]]
 
 
+class TestUpsert:
+    def test_on_conflict_nothing(self, db):
+        db.execute('CREATE TABLE t (a INT PRIMARY KEY, b TEXT)')
+        db.execute("INSERT INTO t VALUES (1, 'hello')")
+        db.execute("INSERT INTO t VALUES (2, 'world')")
+        res = db.execute("INSERT INTO t VALUES (1, 'dup') ON CONFLICT DO NOTHING")
+        res = db.execute('SELECT * FROM t')
+        assert res == [[1, 'hello'], [2, 'world']]
+
+    def test_on_conflict_nothing_new_row(self, db):
+        db.execute('CREATE TABLE t (a INT PRIMARY KEY, b TEXT)')
+        db.execute("INSERT INTO t VALUES (1, 'hello')")
+        db.execute("INSERT INTO t VALUES (3, 'new') ON CONFLICT DO NOTHING")
+        res = db.execute('SELECT * FROM t')
+        assert res == [[1, 'hello'], [3, 'new']]
+
+    def test_insert_or_ignore(self, db):
+        db.execute('CREATE TABLE t (a INT PRIMARY KEY, b TEXT)')
+        db.execute("INSERT INTO t VALUES (1, 'hello')")
+        db.execute("INSERT OR IGNORE INTO t VALUES (1, 'ignored')")
+        res = db.execute('SELECT * FROM t')
+        assert res == [[1, 'hello']]
+
+    def test_upsert_integer_pk_no_pk_value(self, db):
+        """ON CONFLICT with auto-generated rowid (no explicit PK in values)."""
+        db.execute('CREATE TABLE t (a INT PRIMARY KEY, b TEXT)')
+        db.execute("INSERT INTO t VALUES (1, 'hello')")
+        db.execute("INSERT INTO t VALUES (2, 'world')")
+        db.execute("INSERT INTO t VALUES (3, 'new') ON CONFLICT DO NOTHING")
+        res = db.execute('SELECT * FROM t ORDER BY a')
+        assert res == [[1, 'hello'], [2, 'world'], [3, 'new']]
+
+
 class TestTransactions:
     def test_begin_commit(self, db):
         db.execute('CREATE TABLE t (a INT)')
