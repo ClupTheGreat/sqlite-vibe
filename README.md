@@ -32,6 +32,59 @@ Or run directly from the repo:
 PYTHONPATH=. python -c "from pysqlite import Database; print(Database(':memory:'))"
 ```
 
+## CLI (Interactive REPL)
+
+Launch the interactive SQLite shell:
+
+```bash
+# After pip install:
+pysqlite
+
+# Or directly from the repo:
+python -m pysqlite.cli
+python pysqlite/cli.py
+
+# Open a specific database:
+pysqlite /path/to/file.db
+python -m pysqlite.cli /path/to/file.db
+```
+
+### Dot Commands
+
+| Command | Description |
+|---------|-------------|
+| `.open FILE` | Open a database file |
+| `.tables [PAT]` | List tables (optionally matching pattern) |
+| `.schema [TABLE]` | Show CREATE statements |
+| `.indexes [TABLE]` | List indexes |
+| `.mode MODE` | Set output mode: `list`, `column`, `csv`, `json`, `box` |
+| `.headers ON\|OFF` | Toggle column headers |
+| `.separator STR` | Set field separator (default `\|`) |
+| `.nullvalue STR` | Set NULL display string |
+| `.timer ON\|OFF` | Toggle query timing |
+| `.echo ON\|OFF` | Toggle SQL echo |
+| `.databases` | List databases |
+| `.show` | Show current settings |
+| `.save FILE` | Save in-memory DB to file |
+| `.exit` / `.quit` | Exit REPL |
+| `.help` | Show help |
+
+### Example
+
+```
+$ pysqlite
+pysqlite> CREATE TABLE users (id INT, name TEXT);
+pysqlite> INSERT INTO users VALUES (1, 'Alice'), (2, 'Bob');
+pysqlite> .headers on
+pysqlite> .mode column
+pysqlite> SELECT * FROM users;
+id  | name
+----|------
+1   | Alice
+2   | Bob
+pysqlite> .exit
+```
+
 ## API Reference
 
 ### Database
