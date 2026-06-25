@@ -2499,6 +2499,8 @@ class Compiler:
             from pysqlite.ast import Literal
             if isinstance(value, Literal):
                 value = value.value
+            elif hasattr(value, 'name'):
+                value = value.name
             else:
                 value = str(value)
         if value is not None:

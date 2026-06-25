@@ -701,7 +701,8 @@ class BTreeCursor:
             cell = TableLeafCell.parse(key)
             promoted = TableInteriorCell(old_page.page_number, cell.rowid)
         else:
-            promoted = IndexInteriorCell(old_page.page_number, key)
+            leaf_cell = IndexLeafCell.parse(key)
+            promoted = IndexInteriorCell(old_page.page_number, leaf_cell.payload)
         if not path:
             # Need a new root
             new_root = self.btree.create_interior_page(old_page.page_number)
@@ -710,11 +711,16 @@ class BTreeCursor:
             root_page.right_child = new_page_num
             root_page.flush()
             self.btree.root_page = new_root
+            if self.btree._table_def is not None:
+                self.btree._table_def.root_page = new_root
             path.append(new_root)
         else:
             parent_num = path[-1]
             parent = BTreePage(self.btree.pager, parent_num)
-            parent.insert_cell(parent.cell_count, promoted.serialize())
+            if not parent.insert_cell(parent.cell_count, promoted.serialize()):
+                self._split_interior_page([parent_num], parent, parent.cell_count, promoted, new_page_num,
+                                          old_page.page_type == PT_LEAF_TABLE)
+                return
             parent.right_child = new_page_num
             parent.flush()
 
@@ -769,16 +775,18 @@ class BTreeCursor:
         if not path:
             new_root = self.btree.create_interior_page(new_page.page_number)
             new_root_page = BTreePage(self.btree.pager, new_root)
-            promoted_data = middle_data if page.page_type == PT_LEAF_TABLE else middle_data
             if page.page_type == PT_LEAF_TABLE:
                 middle_cell = TableLeafCell.parse(middle_data)
                 promoted_cell = TableInteriorCell(page.page_number, middle_cell.rowid)
             else:
-                promoted_cell = IndexInteriorCell(page.page_number, middle_data)
+                middle_cell = IndexLeafCell.parse(middle_data)
+                promoted_cell = IndexInteriorCell(page.page_number, middle_cell.payload)
             new_root_page.insert_cell(0, promoted_cell.serialize())
             new_root_page.right_child = new_page.page_number
             new_root_page.flush()
             self.btree.root_page = new_root
+            if self.btree._table_def is not None:
+                self.btree._table_def.root_page = new_root
         else:
             self._promote_to_parent(path, middle_data, new_page_num, page.page_number, page.is_table())
 
@@ -792,11 +800,113 @@ class BTreeCursor:
             middle_cell = TableLeafCell.parse(middle_data)
             promoted = TableInteriorCell(old_page_num, middle_cell.rowid)
         else:
-            promoted = IndexInteriorCell(old_page_num, middle_data)
+            middle_cell = IndexLeafCell.parse(middle_data)
+            promoted = IndexInteriorCell(old_page_num, middle_cell.payload)
 
-        parent.insert_cell(parent_idx, promoted.serialize())
-        parent.right_child = new_page_num
+        if not parent.insert_cell(parent_idx, promoted.serialize()):
+            self._split_interior_page(path, parent, parent_idx, promoted, new_page_num, is_table)
+            return
+
+        if parent_idx < parent.cell_count - 1:
+            next_data = parent.read_cell(parent_idx + 1)
+            parent.delete_cell(parent_idx + 1)
+            if is_table:
+                next_cell = TableInteriorCell.parse(next_data)
+                updated = TableInteriorCell(new_page_num, next_cell.key)
+            else:
+                next_cell = IndexInteriorCell.parse(next_data)
+                updated = IndexInteriorCell(new_page_num, next_cell.payload)
+            parent.insert_cell(parent_idx + 1, updated.serialize())
+        else:
+            parent.right_child = new_page_num
         parent.flush()
+
+    def _split_interior_page(self, path: list, page: BTreePage, insert_idx: int,
+                              promoted_cell, new_page_num: int, is_table: bool):
+        """Split a full interior page and promote the middle key upward."""
+        entries = []
+        for i in range(page.cell_count):
+            cell_data = page.read_cell(i)
+            if is_table:
+                cell = TableInteriorCell.parse(cell_data)
+                entries.append((cell.key, cell_data))
+            else:
+                cell = IndexInteriorCell.parse(cell_data)
+                rec, _ = Record.decode(cell.payload)
+                key = rec.get_values()[0]
+                entries.append((key, cell_data))
+
+        promoted_data = promoted_cell.serialize()
+        if is_table:
+            entries.append((promoted_cell.key, promoted_data))
+        else:
+            rec, _ = Record.decode(promoted_cell.payload)
+            key = rec.get_values()[0]
+            entries.append((key, promoted_data))
+
+        entries.sort(key=lambda x: x[0])
+        mid = len(entries) // 2
+        middle_key = entries[mid][0]
+        middle_data = entries[mid][1]
+
+        old_right_child = page.right_child
+
+        new_interior_num = self.btree.create_interior_page(old_right_child)
+        new_page = BTreePage(self.btree.pager, new_interior_num)
+
+        page.cell_count = 0
+        page.cell_content_offset = self.btree.pager.page_size
+        page._write_header()
+        page.dirty = True
+        page.cell_pointers.clear()
+
+        for i, (key, data) in enumerate(entries):
+            if i < mid:
+                page.insert_cell(page.cell_count, data)
+            elif i > mid:
+                new_page.insert_cell(new_page.cell_count, data)
+
+        mid_cell_data = entries[mid][1]
+        if is_table:
+            mid_cell = TableInteriorCell.parse(mid_cell_data)
+            promoted = TableInteriorCell(page.page_number, mid_cell.key)
+            page.right_child = mid_cell.left_child_page
+        else:
+            mid_cell = IndexInteriorCell.parse(mid_cell_data)
+            promoted = IndexInteriorCell(page.page_number, mid_cell.payload)
+            page.right_child = mid_cell.left_child_page
+        page.flush()
+        new_page.flush()
+
+        if not path:
+            new_root = self.btree.create_interior_page(new_interior_num)
+            new_root_page = BTreePage(self.btree.pager, new_root)
+            new_root_page.insert_cell(0, promoted.serialize())
+            new_root_page.right_child = new_interior_num
+            new_root_page.flush()
+            self.btree.root_page = new_root
+            if self.btree._table_def is not None:
+                self.btree._table_def.root_page = new_root
+        else:
+            parent_num, parent_idx = path.pop()
+            parent = BTreePage(self.btree.pager, parent_num)
+            promoted_data = promoted.serialize()
+            if not parent.insert_cell(parent_idx, promoted_data):
+                self._split_interior_page(path, parent, parent_idx, promoted, new_interior_num, is_table)
+                return
+            if parent_idx < parent.cell_count - 1:
+                next_data = parent.read_cell(parent_idx + 1)
+                parent.delete_cell(parent_idx + 1)
+                if is_table:
+                    next_cell = TableInteriorCell.parse(next_data)
+                    updated = TableInteriorCell(new_interior_num, next_cell.key)
+                else:
+                    next_cell = IndexInteriorCell.parse(next_data)
+                    updated = IndexInteriorCell(new_interior_num, next_cell.payload)
+                parent.insert_cell(parent_idx + 1, updated.serialize())
+            else:
+                parent.right_child = new_interior_num
+            parent.flush()
 
     def delete(self):
         """Delete the entry at current cursor position."""
@@ -874,12 +984,14 @@ class BTreeCursor:
 class BTree:
     """Manages a B-Tree structure with factory methods for cursors and pages."""
 
-    __slots__ = ('pager', 'root_page', 'is_table')
+    __slots__ = ('pager', 'root_page', 'is_table', '_table_def')
 
-    def __init__(self, pager: 'Pager', root_page: int, is_table: bool = True):
+    def __init__(self, pager: 'Pager', root_page: int, is_table: bool = True,
+                 table_def=None):
         self.pager = pager
         self.root_page = root_page
         self.is_table = is_table
+        self._table_def = table_def
         page = BTreePage(self.pager, root_page)
         if page.page_type == 0:
             page.page_type = PT_LEAF_TABLE if is_table else PT_LEAF_INDEX

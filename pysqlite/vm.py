@@ -289,9 +289,18 @@ class VM:
                             c.int_pk_col_idx = i
                             return
 
+    def _find_table_def_by_root(self, root_page: int):
+        """Find the TableDef whose root_page matches, or None."""
+        if self.tx and self.tx.schema:
+            for td in self.tx.schema.tables.values():
+                if td.root_page == root_page:
+                    return td
+        return None
+
     def _op_OpenRead(self, P1: int, P2: int, P3: int, P4: Any, P5: int):
         without_rowid = isinstance(P4, dict) and P4.get('without_rowid', False)
-        btree = BTree(self.pager, P2, is_table=not without_rowid)
+        table_def = self._find_table_def_by_root(P2)
+        btree = BTree(self.pager, P2, is_table=not without_rowid, table_def=table_def)
         cursor = btree.cursor()
         c = Cursor(btree=btree, cursor=cursor, without_rowid=without_rowid)
         if isinstance(P4, dict):
@@ -302,7 +311,8 @@ class VM:
 
     def _op_OpenWrite(self, P1: int, P2: int, P3: int, P4: Any, P5: int):
         without_rowid = isinstance(P4, dict) and P4.get('without_rowid', False)
-        btree = BTree(self.pager, P2, is_table=not without_rowid)
+        table_def = self._find_table_def_by_root(P2)
+        btree = BTree(self.pager, P2, is_table=not without_rowid, table_def=table_def)
         cursor = btree.cursor()
         c = Cursor(btree=btree, cursor=cursor, is_writable=True, without_rowid=without_rowid)
         if isinstance(P4, dict):
