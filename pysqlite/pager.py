@@ -43,6 +43,8 @@ class DatabaseHeader:
 class Page:
     """A single database page with mutable bytearray data."""
 
+    __slots__ = ('number', 'data', 'dirty')
+
     def __init__(self, number: int, data: bytes, dirty: bool = False):
         self.number = number
         self.data = bytearray(data)
@@ -154,6 +156,14 @@ class Pager:
     Provides page-level read/write, ACID via rollback journal,
     page caching with LRU eviction, and freelist management.
     """
+
+    __slots__ = (
+        'vfs', 'handle', 'page_size', 'total_pages', 'cache', 'dirty_pages',
+        'ref_count', 'freelist_trunk', 'freelist_count', 'db_header',
+        'in_transaction', 'journal_fd', 'journal_mode',
+        'schema_version', 'schema_cookie', 'file_change_counter',
+        '_before_images', '_access_time', '_clock', 'wal',
+    )
 
     def __init__(self, vfs: VFS, path: str, flags: int = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE):
         self.vfs = vfs
@@ -337,13 +347,31 @@ class Pager:
             del self.ref_count[page_number]
 
     def flush(self):
-        """Write all dirty pages to disk."""
-        for page_num in sorted(self.dirty_pages):
+        """Write all dirty pages to disk in batch."""
+        if not self.dirty_pages:
+            return
+        sorted_pages = sorted(self.dirty_pages)
+        # Batch contiguous pages into single writes
+        batch_start = sorted_pages[0]
+        prev = batch_start
+        buf = bytearray()
+        for page_num in sorted_pages:
             page = self.cache[page_num]
-            offset = (page_num - 1) * self.page_size
-            self.vfs.write(self.handle, offset, bytes(page.data))
+            if page_num != prev + 1 and buf:
+                self._write_batch(buf, batch_start, prev)
+                buf = bytearray()
+                batch_start = page_num
+            buf.extend(bytes(page.data))
             page.dirty = False
+            prev = page_num
+        if buf:
+            self._write_batch(buf, batch_start, prev)
         self.dirty_pages.clear()
+
+    def _write_batch(self, data: bytes, first_page: int, last_page: int):
+        n_pages = last_page - first_page + 1
+        offset = (first_page - 1) * self.page_size
+        self.vfs.write(self.handle, offset, bytes(data))
 
     def sync(self):
         """Flush + fsync."""

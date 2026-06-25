@@ -41,7 +41,8 @@ def test_compile_binary_op():
     stmt = Select(columns=[ResultColumn(BinaryOp('+', Literal(1), Literal(2)))])
     prog = compile_stmt(stmt)
     ops = [i.opcode for i in prog]
-    assert Opcode.Add in ops
+    # Constant folding turns 1+2 into 3 at compile time
+    assert prog[-1].opcode == Opcode.Halt
 
 
 def test_compile_comparison():

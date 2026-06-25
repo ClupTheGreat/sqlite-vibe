@@ -302,6 +302,8 @@ class BTreePage:
 class BTreeCursor:
     """Cursor for navigating a B-Tree. Tracks position per level on a stack."""
 
+    __slots__ = ('btree', 'root_page', 'stack', 'eof', 'bof')
+
     def __init__(self, btree: 'BTree', root_page: int):
         self.btree = btree
         self.root_page = root_page
@@ -657,6 +659,65 @@ class BTreeCursor:
         if space_left < 120:
             self._balance(path, leaf_page, insert_idx)
 
+    def bulk_insert(self, entries: list[tuple[int, int, bytes]]):
+        """Insert many sorted entries, minimizing page traversal."""
+        if not entries:
+            return
+        if self.btree.root_page == 0:
+            root = self.btree.create_leaf_page()
+            self.btree.root_page = root
+        page_num = self.btree.root_page
+        page = BTreePage(self.btree.pager, page_num)
+        # Walk down to first leaf
+        path = []
+        while not page.is_leaf():
+            page_num = page.right_child
+            path.append(page_num)
+            page = BTreePage(self.btree.pager, page_num)
+        for key, rowid, payload in entries:
+            if page.page_type == PT_LEAF_TABLE:
+                cell_data = page._make_leaf_cell_data(rowid, payload)
+            else:
+                cell_data = IndexLeafCell(payload).serialize()
+            if not page.insert_cell(page.cell_count, cell_data):
+                # Page full — flush, allocate new page, update parent chain
+                page.flush()
+                new_page_num = self.btree.create_leaf_page()
+                new_page = BTreePage(self.btree.pager, new_page_num)
+                # Promote to parent
+                self._bulk_promote(page, new_page_num, path, cell_data)
+                page = BTreePage(self.btree.pager, new_page_num)
+                page.insert_cell(0, cell_data)
+            else:
+                page.dirty = True
+        page.flush()
+        self.btree.pager.flush()
+
+    def _bulk_promote(self, old_page: BTreePage, new_page_num: int,
+                      path: list, inserted_cell: bytes):
+        """Update parent chain to point to new rightmost leaf."""
+        key = old_page.read_cell(0)
+        if old_page.page_type == PT_LEAF_TABLE:
+            cell = TableLeafCell.parse(key)
+            promoted = TableInteriorCell(old_page.page_number, cell.rowid)
+        else:
+            promoted = IndexInteriorCell(old_page.page_number, key)
+        if not path:
+            # Need a new root
+            new_root = self.btree.create_interior_page(old_page.page_number)
+            root_page = BTreePage(self.btree.pager, new_root)
+            root_page.insert_cell(0, promoted.serialize())
+            root_page.right_child = new_page_num
+            root_page.flush()
+            self.btree.root_page = new_root
+            path.append(new_root)
+        else:
+            parent_num = path[-1]
+            parent = BTreePage(self.btree.pager, parent_num)
+            parent.insert_cell(parent.cell_count, promoted.serialize())
+            parent.right_child = new_page_num
+            parent.flush()
+
     def _balance(self, path: list, page: BTreePage, insert_idx: int,
                   extra_cell: bytes | None = None):
         """Split a full leaf page and cascade splits upward."""
@@ -812,6 +873,8 @@ class BTreeCursor:
 
 class BTree:
     """Manages a B-Tree structure with factory methods for cursors and pages."""
+
+    __slots__ = ('pager', 'root_page', 'is_table')
 
     def __init__(self, pager: 'Pager', root_page: int, is_table: bool = True):
         self.pager = pager

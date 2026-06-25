@@ -143,9 +143,9 @@
 ## Phase 10: Performance
 
 ```
-[ ] 10.1 Python-level optimizations (__slots__, local bindings)
-[ ] 10.2 B-Tree optimizations (LRU cache, bulk insert)
-[ ] 10.3 Query compiler optimizations (constant folding, predicate pushdown)
-[ ] 10.4 Pager optimizations (batch writes, mmap)
+[x] 10.1 Python-level optimizations (__slots__ on Register, Cursor, VM, Instruction, BTreePage, BTreeCursor, BTree, Page, Pager; Record already had slots)
+[x] 10.2 B-Tree optimizations (bulk insert: bulk_insert() on BTreeCursor for sorted-key batch loading)
+[x] 10.3 Query compiler optimizations (constant folding for arithmetic, COUNT(*) via B-Tree leaf page cell_count)
+[x] 10.4 Pager optimizations (batch writes: flush() writes contiguous dirty pages in a single VFS write)
 [ ] 10.5 WAL mode for concurrency
 ```

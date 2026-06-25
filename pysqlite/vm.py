@@ -17,7 +17,7 @@ class RegisterType:
     BLOB = 'BLOB'
 
 
-@dataclass
+@dataclass(slots=True)
 class Register:
     type: str = RegisterType.NULL
     value: Any = None
@@ -44,7 +44,7 @@ def make_register(value: Any) -> Register:
     return Register(RegisterType.TEXT, str(value))
 
 
-@dataclass
+@dataclass(slots=True)
 class Cursor:
     btree: BTree
     cursor: BTreeCursor
@@ -68,6 +68,14 @@ class VmError(DatabaseError):
 
 
 class VM:
+    __slots__ = (
+        'pager', 'tx', 'program', 'pc', 'registers', 'cursors',
+        'result_rows', 'error', 'last_rowid', 'changes', 'compare_flags',
+        'agg_accumulators', 'agg_instances', 'sub_return_stack',
+        'explain_mode', '_current_row', '_affinity_cache',
+        'sort_spec', 'agg_spec', 'custom_functions', 'custom_aggregates', 'params',
+    )
+
     def __init__(self, pager, tx=None, custom_functions=None, custom_aggregates=None):
         self.pager = pager
         self.tx = tx
@@ -829,10 +837,15 @@ class VM:
         count = 0
         for c_id, c in self.cursors.items():
             try:
-                c.cursor.first()
-                while not c.cursor.eof:
-                    count += 1
-                    c.cursor.next()
+                from pysqlite.btree import BTreePage, PT_LEAF_TABLE, PT_LEAF_INDEX
+                page = BTreePage(c.btree.pager, c.btree.root_page)
+                if page.page_type in (PT_LEAF_TABLE, PT_LEAF_INDEX):
+                    count += page.cell_count
+                else:
+                    c.cursor.first()
+                    while not c.cursor.eof:
+                        count += 1
+                        c.cursor.next()
             except Exception:
                 pass
         self._set_reg(P1, Register(RegisterType.INT, count))

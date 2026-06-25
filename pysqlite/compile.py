@@ -488,8 +488,48 @@ class Compiler:
         '<': Opcode.Lt, '<=': Opcode.Le, '>': Opcode.Gt, '>=': Opcode.Ge,
     }
 
+    @staticmethod
+    def _fold_const(lv: int | float, op: str, rv: int | float) -> int | float | None:
+        if op == '+': return lv + rv
+        if op == '-': return lv - rv
+        if op == '*': return lv * rv
+        if op == '/':
+            if rv == 0: return None
+            return lv / rv
+        if op == '%':
+            if rv == 0: return None
+            return lv % rv
+        if op == '||': return str(lv) + str(rv)
+        if op == '&': return int(lv) & int(rv)
+        if op == '|': return int(lv) | int(rv)
+        if op == '<<': return int(lv) << int(rv)
+        if op == '>>': return int(lv) >> int(rv)
+        return None
+
+    def _emit_const(self, value: Any, reg: int):
+        if isinstance(value, int):
+            self.emit(Opcode.Integer, P1=value, P2=reg, comment='const fold')
+        elif isinstance(value, float):
+            self.emit(Opcode.Real, P1=value, P2=reg, comment='const fold')
+        elif isinstance(value, str):
+            self.emit(Opcode.String, P4=value, P2=reg, comment='const fold')
+        else:
+            self.emit(Opcode.Null, P1=reg, comment='const fold')
+
     def _compile_binary_op(self, expr: BinaryOp, reg: int, cursor: int):
         op = expr.op
+        # Constant folding for arithmetic: evaluate 1+2 at compile time
+        if op in ('+', '-', '*', '/', '%', '||', '&', '|', '<<', '>>'):
+            if isinstance(expr.left, Literal) and isinstance(expr.right, Literal):
+                lv, rv = expr.left.value, expr.right.value
+                if isinstance(lv, (int, float)) and isinstance(rv, (int, float)):
+                    try:
+                        folded = self._fold_const(lv, op, rv)
+                        if folded is not None:
+                            self._emit_const(folded, reg)
+                            return
+                    except Exception:
+                        pass
         if op == 'AND':
             end_label = self._label_name('and_end')
             false_label = self._label_name('and_false')
