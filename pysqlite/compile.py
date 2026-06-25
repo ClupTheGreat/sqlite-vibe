@@ -497,11 +497,23 @@ class Compiler:
                 self.emit(Opcode.Rewind, P1=cursor, P2=len(self.instructions) + 4,
                           comment='rewind')
             elif isinstance(table_ref, SubqueryTable):
-                sub = Compiler(self.schema, self.db)
-                sub_prog = sub.compile(table_ref.select)
-                self.instructions.extend(sub_prog)
+                sub_select = table_ref.select
+                from pysqlite.schema import AFFINITY
+                sub_cols = []
+                for rc in sub_select.columns:
+                    if rc.alias:
+                        cname = rc.alias
+                    elif isinstance(rc.expr, ColumnRef):
+                        cname = rc.expr.name
+                    else:
+                        cname = f'col_{len(sub_cols)}'
+                    sub_cols.append(ColumnDef(name=cname, affinity=AFFINITY.BLOB))
+                td = TableDef(name=table_ref.alias or '_sub', columns=sub_cols, root_page=0, sql='')
+                self.cursor_table[cursor] = td
                 self.emit(Opcode.OpenEphemeral, P1=cursor, P2=1,
                           comment='subquery result')
+                self._compile_subquery_fill(sub_select, cursor, sub_cols)
+                self.emit(Opcode.Rewind, P1=cursor, P2=0, comment='rewind subquery result')
             else:
                 self.emit(Opcode.OpenEphemeral, P1=cursor, P2=1,
                           comment='table ref')
@@ -586,11 +598,23 @@ class Compiler:
                 self.emit(Opcode.Rewind, P1=cursor, P2=len(self.instructions) + 4,
                           comment='rewind')
             elif isinstance(table_ref, SubqueryTable):
-                sub = Compiler(self.schema, self.db)
-                sub_prog = sub.compile(table_ref.select)
-                self.instructions.extend(sub_prog)
+                sub_select = table_ref.select
+                from pysqlite.schema import AFFINITY
+                sub_cols = []
+                for rc in sub_select.columns:
+                    if rc.alias:
+                        cname = rc.alias
+                    elif isinstance(rc.expr, ColumnRef):
+                        cname = rc.expr.name
+                    else:
+                        cname = f'col_{len(sub_cols)}'
+                    sub_cols.append(ColumnDef(name=cname, affinity=AFFINITY.BLOB))
+                td = TableDef(name=table_ref.alias or '_sub', columns=sub_cols, root_page=0, sql='')
+                self.cursor_table[cursor] = td
                 self.emit(Opcode.OpenEphemeral, P1=cursor, P2=1,
                           comment='subquery result')
+                self._compile_subquery_fill(sub_select, cursor, sub_cols)
+                self.emit(Opcode.Rewind, P1=cursor, P2=0, comment='rewind subquery result')
             else:
                 self.emit(Opcode.OpenEphemeral, P1=cursor, P2=1,
                           comment='table ref')
@@ -768,6 +792,63 @@ class Compiler:
         if select.from_clause:
             self.emit(Opcode.Next, P1=src_cursor, P2=loop_start, comment='next row')
 
+    def _compile_subquery_fill(self, sub_select: Select, target_cursor: int, sub_cols: list):
+        """Compile a subquery to fill an ephemeral table (for SubqueryTable in FROM)."""
+        src_cursor = self.alloc_cursor()
+        if sub_select.from_clause:
+            src_ref = sub_select.from_clause[0]
+            if isinstance(src_ref, TableName):
+                src_td = self._lookup_table_def(src_ref.name, src_ref.schema)
+                self.cursor_table[src_cursor] = src_td
+                self.emit(Opcode.Transaction, P1=0, comment='begin read')
+                self.emit(Opcode.OpenRead, P1=src_cursor, P2=src_td.root_page,
+                          P3=len(src_td.columns), comment=f'open {src_td.name}')
+                self.emit(Opcode.Rewind, P1=src_cursor, P2=len(self.instructions) + 4,
+                          comment='rewind')
+            else:
+                self.emit(Opcode.OpenEphemeral, P1=src_cursor, P2=1, comment='dummy scan')
+        else:
+            self.emit(Opcode.OpenEphemeral, P1=src_cursor, P2=1, comment='dummy scan')
+
+        fill_loop = len(self.instructions)
+
+        # WHERE
+        where_skip = None
+        if sub_select.where:
+            where_reg = self.compile_expr(sub_select.where, src_cursor)
+            where_skip = self._label_name('subq_where_skip')
+            self.emit_ifnot(where_reg, where_skip)
+
+        # Compute column values
+        col_regs = []
+        for rc in sub_select.columns:
+            if isinstance(rc.expr, StarExpr):
+                src_td = self._lookup_table(src_cursor)
+                for i in range(len(getattr(src_td, 'columns', []))):
+                    r = self.alloc_reg()
+                    col_regs.append(r)
+                    self.emit(Opcode.Column, P1=src_cursor, P2=i, P3=r,
+                              comment=f'column {i}')
+            else:
+                r = self.compile_expr(rc.expr, src_cursor)
+                col_regs.append(r)
+
+        # Insert into ephemeral
+        rowid_reg = self.alloc_reg()
+        self.emit(Opcode.NewRowid, P1=target_cursor, P2=0, P3=rowid_reg, comment='new rowid')
+        first_val = col_regs[0] if col_regs else self.reg_null
+        record_reg = self.alloc_reg()
+        self.emit(Opcode.MakeRecord, P1=first_val, P2=len(col_regs),
+                  P3=record_reg, comment='make record')
+        self.emit(Opcode.Insert, P1=target_cursor, P2=record_reg, P3=rowid_reg,
+                  comment='insert into ephemeral')
+
+        if where_skip:
+            self.define_label(where_skip)
+
+        if sub_select.from_clause:
+            self.emit(Opcode.Next, P1=src_cursor, P2=fill_loop, comment='next row')
+
     # ── UPDATE ──
 
     def _compile_update(self, node: Update):
@@ -911,6 +992,27 @@ class Compiler:
 
     def _compile_create_index(self, node: CreateIndex):
         self.emit(Opcode.Transaction, P1=1, comment='DDL begin write')
+        col_names = []
+        for c in node.columns:
+            if isinstance(c.expr, ColumnRef):
+                col_names.append(c.expr.name)
+            else:
+                col_names.append(str(c.expr))
+        sql = f"CREATE INDEX {node.name} ON {node.table.name} ({', '.join(col_names)})"
+        from pysqlite.schema import IndexDef, IndexedColumnDef
+        cols = []
+        for c in node.columns:
+            name = c.expr.name if isinstance(c.expr, ColumnRef) else str(c.expr)
+            cols.append(IndexedColumnDef(name=name, collation=getattr(c, 'collation', None), order=c.direction))
+        idx = IndexDef(name=node.name, table_name=node.table.name, columns=cols, unique=node.unique, sql=sql)
+        if self.schema:
+            self.schema.indexes[node.name] = idx
+            from pysqlite.btree import BTree
+            btree = BTree(self.db, 1, is_table=True)
+            self.schema._insert_schema_entry(
+                btree, type_='index', name=node.name,
+                tbl_name=node.table.name, rootpage=0, sql=sql,
+            )
         self.emit(Opcode.CreateIndex, P1=0, P4=node.name,
                   comment=f'CREATE INDEX {node.name}')
 
@@ -921,6 +1023,8 @@ class Compiler:
 
     def _compile_drop_index(self, node: DropIndex):
         self.emit(Opcode.Transaction, P1=1, comment='DDL begin write')
+        if self.schema:
+            self.schema.indexes.pop(node.name, None)
         self.emit(Opcode.DropIndex, P1=0, P4=node.name,
                   comment=f'DROP INDEX {node.name}')
 
@@ -1029,8 +1133,138 @@ class Compiler:
     # ── PRAGMA ──
 
     def _compile_pragma(self, node: Pragma):
+        name = node.name.lower()
+        value = node.value
+        if isinstance(value, Expr):
+            from pysqlite.ast import Literal
+            if isinstance(value, Literal):
+                value = value.value
+            else:
+                value = str(value)
+        if value is not None:
+            value = str(value)
+
+        # PRAGMA that return table metadata
+        if name == 'table_info' and value is not None:
+            td = self._lookup_table_def(value)
+            for i, col in enumerate(td.columns or []):
+                r = self.alloc_reg()
+                self.emit(Opcode.Integer, P1=i, P2=r, comment='cid')
+                r2 = self.alloc_reg()
+                self.emit(Opcode.String, P4=col.name, P2=r2, comment='name')
+                r3 = self.alloc_reg()
+                type_str = col.type_name.name if col.type_name else 'BLOB'
+                self.emit(Opcode.String, P4=type_str, P2=r3, comment='type')
+                r4 = self.alloc_reg()
+                self.emit(Opcode.Integer, P1=1 if col.not_null else 0, P2=r4, comment='notnull')
+                r5 = self.alloc_reg()
+                dflt = col.default_value if col.default_value is not None else ''
+                self.emit(Opcode.String, P4=str(dflt), P2=r5, comment='dflt_value')
+                r6 = self.alloc_reg()
+                self.emit(Opcode.Integer, P1=1 if col.primary_key else 0, P2=r6, comment='pk')
+                self.emit(Opcode.ResultRow, P1=r, P2=6, comment='table_info row')
+            return
+
+        if name == 'index_list' and value is not None:
+            indexes = self.schema.get_table_indexes(value) if self.schema else []
+            for i, idx in enumerate(indexes):
+                r = self.alloc_reg()
+                self.emit(Opcode.Integer, P1=i, P2=r, comment='seq')
+                r2 = self.alloc_reg()
+                self.emit(Opcode.String, P4=idx.name, P2=r2, comment='name')
+                r3 = self.alloc_reg()
+                self.emit(Opcode.Integer, P1=1 if idx.unique else 0, P2=r3, comment='unique')
+                self.emit(Opcode.ResultRow, P1=r, P2=3, comment='index_list row')
+            return
+
+        if name == 'index_info' and value is not None:
+            idx = self.schema.get_index(value) if self.schema else None
+            if idx is not None and idx.columns:
+                td = self._lookup_table_def(idx.table_name)
+                for i, col in enumerate(idx.columns):
+                    r = self.alloc_reg()
+                    self.emit(Opcode.Integer, P1=i, P2=r, comment='seqno')
+                    r2 = self.alloc_reg()
+                    cid = 0
+                    if td and td.columns:
+                        for ci, tc in enumerate(td.columns):
+                            if tc.name.upper() == col.name.upper():
+                                cid = ci
+                                break
+                    self.emit(Opcode.Integer, P1=cid, P2=r2, comment='cid')
+                    r3 = self.alloc_reg()
+                    self.emit(Opcode.String, P4=col.name, P2=r3, comment='name')
+                    self.emit(Opcode.ResultRow, P1=r, P2=3, comment='index_info row')
+            return
+
+        # PRAGMAs that return a single value
+        if name == 'page_count':
+            r = self.alloc_reg()
+            self.emit(Opcode.Integer, P1=self.db.total_pages if self.db else 0, P2=r)
+            self.emit(Opcode.ResultRow, P1=r, P2=1)
+            return
+
+        if name == 'page_size':
+            r = self.alloc_reg()
+            self.emit(Opcode.Integer, P1=self.db.page_size if self.db else 4096, P2=r)
+            self.emit(Opcode.ResultRow, P1=r, P2=1)
+            return
+
+        if name == 'schema_version':
+            r = self.alloc_reg()
+            ver = self.schema.schema_version if self.schema else 0
+            self.emit(Opcode.Integer, P1=ver, P2=r)
+            self.emit(Opcode.ResultRow, P1=r, P2=1)
+            return
+
+        if name == 'user_version':
+            r = self.alloc_reg()
+            ver = self.db.db_header.user_version if self.db and self.db.db_header else 0
+            self.emit(Opcode.Integer, P1=ver, P2=r)
+            self.emit(Opcode.ResultRow, P1=r, P2=1)
+            return
+
+        if name == 'application_id':
+            r = self.alloc_reg()
+            aid = self.db.db_header.application_id if self.db and self.db.db_header else 0
+            self.emit(Opcode.Integer, P1=aid, P2=r)
+            self.emit(Opcode.ResultRow, P1=r, P2=1)
+            return
+
+        if name == 'freelist_count':
+            r = self.alloc_reg()
+            self.emit(Opcode.Integer, P1=self.db.freelist_count if self.db else 0, P2=r)
+            self.emit(Opcode.ResultRow, P1=r, P2=1)
+            return
+
+        if name == 'encoding':
+            r = self.alloc_reg()
+            enc = 'UTF-8'
+            if self.db and self.db.db_header:
+                e = self.db.db_header.text_encoding
+                enc = {1: 'UTF-8', 2: 'UTF-16le', 3: 'UTF-16be'}.get(e, 'UTF-8')
+            self.emit(Opcode.String, P4=enc, P2=r)
+            self.emit(Opcode.ResultRow, P1=r, P2=1)
+            return
+
+        if name == 'database_list':
+            r = self.alloc_reg()
+            self.emit(Opcode.Integer, P1=0, P2=r, comment='seq')
+            r2 = self.alloc_reg()
+            self.emit(Opcode.String, P4='main', P2=r2, comment='name')
+            r3 = self.alloc_reg()
+            path = self.db.handle.path if self.db and self.db.handle else ''
+            self.emit(Opcode.String, P4=path, P2=r3, comment='file')
+            self.emit(Opcode.ResultRow, P1=r, P2=3, comment='database_list')
+            return
+
+        if name in ('compile_options', 'collation_list'):
+            # Return empty result set (no custom options/collations registered)
+            return
+
+        # Fallback: return value as string
         reg = self.alloc_reg()
-        self.emit(Opcode.String, P4=str(node.value) if node.value is not None else '',
+        self.emit(Opcode.String, P4=str(value) if value is not None else '',
                   P2=reg, comment=f'PRAGMA {node.name}')
         self.emit(Opcode.ResultRow, P1=reg, P2=1, comment='pragma result')
 

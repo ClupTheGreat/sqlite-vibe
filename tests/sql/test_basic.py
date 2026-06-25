@@ -408,6 +408,94 @@ class TestViews:
         assert db.schema.get_view('v') is None
 
 
+class TestPragmas:
+    def test_page_count(self, db):
+        db.execute('CREATE TABLE t (a INT)')
+        res = db.execute('PRAGMA page_count')
+        assert res[0][0] >= 1
+
+    def test_page_size(self, db):
+        res = db.execute('PRAGMA page_size')
+        assert res[0][0] == 4096
+
+    def test_table_info(self, db):
+        db.execute('CREATE TABLE t (a INT PRIMARY KEY, b TEXT NOT NULL)')
+        res = db.execute("PRAGMA table_info('t')")
+        assert len(res) == 2
+        assert res[0] == [0, 'a', 'INT', 0, '', 1]
+        assert res[1] == [1, 'b', 'TEXT', 1, '', 0]
+
+    def test_index_list(self, db):
+        db.execute('CREATE TABLE t (a INT)')
+        db.execute('CREATE UNIQUE INDEX idx_t_a ON t(a)')
+        res = db.execute("PRAGMA index_list('t')")
+        assert len(res) == 1
+        assert res[0][1] == 'idx_t_a'
+        assert res[0][2] == 1  # unique
+
+    def test_index_info(self, db):
+        db.execute('CREATE TABLE t (a INT, b TEXT)')
+        db.execute('CREATE INDEX idx_t_a ON t(a)')
+        res = db.execute("PRAGMA index_info('idx_t_a')")
+        assert len(res) == 1
+        assert res[0] == [0, 0, 'a']
+
+    def test_encoding(self, db):
+        res = db.execute('PRAGMA encoding')
+        assert res[0][0] == 'UTF-8'
+
+    def test_database_list(self, db):
+        res = db.execute('PRAGMA database_list')
+        assert len(res) == 1
+        assert res[0][1] == 'main'
+
+    def test_user_version(self, db):
+        res = db.execute('PRAGMA user_version')
+        assert res[0][0] == 0
+
+    def test_freelist_count(self, db):
+        res = db.execute('PRAGMA freelist_count')
+        assert res[0][0] == 0
+
+
+class TestSubqueryFrom:
+    def test_basic_subquery(self, db):
+        db.execute('CREATE TABLE t (a INT)')
+        db.execute('INSERT INTO t VALUES (1)')
+        db.execute('INSERT INTO t VALUES (2)')
+        res = db.execute('SELECT * FROM (SELECT a FROM t) AS sub')
+        assert res == [[1], [2]]
+
+    def test_subquery_with_where(self, db):
+        db.execute('CREATE TABLE t (a INT)')
+        db.execute('INSERT INTO t VALUES (1)')
+        db.execute('INSERT INTO t VALUES (2)')
+        db.execute('INSERT INTO t VALUES (3)')
+        res = db.execute('SELECT * FROM (SELECT a FROM t WHERE a > 1) AS sub')
+        assert res == [[2], [3]]
+
+    def test_subquery_column_select(self, db):
+        db.execute('CREATE TABLE t (a INT, b TEXT)')
+        db.execute("INSERT INTO t VALUES (1, 'hello')")
+        db.execute("INSERT INTO t VALUES (2, 'world')")
+        res = db.execute('SELECT sub.a FROM (SELECT a, b FROM t) AS sub WHERE sub.a > 1')
+        assert res == [[2]]
+
+    def test_subquery_expression_col(self, db):
+        db.execute('CREATE TABLE t (a INT)')
+        db.execute('INSERT INTO t VALUES (1)')
+        db.execute('INSERT INTO t VALUES (2)')
+        res = db.execute('SELECT x FROM (SELECT a*2 AS x FROM t) AS sub')
+        assert res == [[2], [4]]
+
+    def test_subquery_alias_ref(self, db):
+        db.execute('CREATE TABLE t (a INT)')
+        db.execute('INSERT INTO t VALUES (1)')
+        db.execute('INSERT INTO t VALUES (2)')
+        res = db.execute('SELECT x FROM (SELECT a+10 AS x FROM t) AS sub')
+        assert len(res) == 2
+
+
 class TestTransactions:
     def test_begin_commit(self, db):
         db.execute('CREATE TABLE t (a INT)')

@@ -112,7 +112,7 @@
 [ ] 7.13 STRICT tables
 [ ] 7.14 Generated columns (VIRTUAL/STORED)
 [ ] 7.15 Full-text search (FTS5)
-[ ] 7.16 PRAGMAs (all query/set variants)
+[x] 7.16 PRAGMAs (table_info, index_list, index_info, page_count, page_size, schema_version, user_version, application_id, freelist_count, encoding, database_list, compile_options, collation_list)
 [ ] 7.17 Integrity check
 [ ] 7.18 ANALYZE (sqlite_stat1, stat4)
 ```
