@@ -49,6 +49,105 @@ class Page:
         self.dirty = dirty
 
 
+class WAL:
+    """Write-Ahead Log for WAL journal mode.
+
+    Appends pages to a .wal file instead of journaling.
+    Readers consult WAL before the main database.
+    """
+
+    WAL_MAGIC = 0x8c6c6f67
+
+    def __init__(self, vfs: VFS, db_path: str, page_size: int):
+        self.vfs = vfs
+        self.path = db_path + '-wal'
+        self.page_size = page_size
+        self.handle = None
+        self.index: dict[int, bytes] = {}
+        self.n_frames = 0
+        self.checkpoint_seq = 0
+        self._open_or_create()
+
+    def _open_or_create(self):
+        if self.vfs.file_exists(self.path):
+            self.handle = self.vfs.open(self.path, SQLITE_OPEN_READWRITE)
+            self._read_frames()
+        else:
+            self.handle = self.vfs.open(self.path, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE)
+            self._write_header()
+
+    def _write_header(self):
+        import random
+        buf = bytearray(32)
+        buf[0:4] = self.WAL_MAGIC.to_bytes(4, 'big')
+        buf[4:8] = (3007000).to_bytes(4, 'big')
+        buf[8:12] = self.page_size.to_bytes(4, 'big')
+        buf[12:16] = self.checkpoint_seq.to_bytes(4, 'big')
+        buf[16:20] = (0).to_bytes(4, 'big')
+        buf[20:24] = (0).to_bytes(4, 'big')
+        self.vfs.write(self.handle, 0, bytes(buf))
+        self.vfs.sync(self.handle, SYNC_FULL)
+
+    def _read_frames(self):
+        self.index.clear()
+        self.n_frames = 0
+        size = self.vfs.file_size(self.handle)
+        if size < 32:
+            return
+        header = self.vfs.read(self.handle, 0, 32)
+        if int.from_bytes(header[0:4], 'big') != self.WAL_MAGIC:
+            return
+        self.checkpoint_seq = int.from_bytes(header[12:16], 'big')
+        frame_size = self.page_size
+        offset = 32
+        while offset + frame_size <= size:
+            page_no = int.from_bytes(self.vfs.read(self.handle, offset, 4), 'big')
+            page_data = self.vfs.read(self.handle, offset + 8, self.page_size)
+            self.index[page_no] = page_data
+            self.n_frames += 1
+            offset += 8 + frame_size
+
+    def append_frame(self, page_no: int, data: bytes):
+        frame_size = 8 + self.page_size
+        offset = 32 + self.n_frames * frame_size
+        buf = bytearray(frame_size)
+        buf[0:4] = page_no.to_bytes(4, 'big')
+        buf[4:8] = (0).to_bytes(4, 'big')
+        buf[8:8 + self.page_size] = data[:self.page_size]
+        self.vfs.write(self.handle, offset, bytes(buf))
+        self.index[page_no] = data
+        self.n_frames += 1
+
+    def read_page(self, page_no: int) -> bytes | None:
+        return self.index.get(page_no)
+
+    def close(self):
+        if self.handle is not None:
+            self.vfs.close(self.handle)
+            self.handle = None
+
+    def delete(self):
+        self.close()
+        if self.vfs.file_exists(self.path):
+            self.vfs.delete(self.path)
+
+    def checkpoint(self, target_pager):
+        """Copy all WAL pages back to the main database file."""
+        if not self.n_frames:
+            return
+        for page_no, data in list(self.index.items()):
+            offset = (page_no - 1) * target_pager.page_size
+            target_pager.vfs.write(target_pager.handle, offset, data)
+        target_pager.vfs.sync(target_pager.handle, SYNC_FULL)
+        self.vfs.close(self.handle)
+        self.vfs.delete(self.path)
+        self.handle = self.vfs.open(self.path, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE)
+        self.index.clear()
+        self.n_frames = 0
+        self.checkpoint_seq += 1
+        self._write_header()
+
+
 class Pager:
     """Manages the database as an array of fixed-size pages.
 
@@ -76,6 +175,7 @@ class Pager:
         self._before_images: dict[int, bytes] = {}
         self._access_time: dict[int, int] = {}
         self._clock: int = 0
+        self.wal: WAL | None = None
 
         self._open_db()
 
@@ -175,13 +275,22 @@ class Pager:
     # ---- page read / write ----
 
     def read_page(self, page_number: int) -> bytearray:
-        """Read a page from cache or disk. Returns mutable bytearray."""
+        """Read a page from cache or disk (or WAL). Returns mutable bytearray."""
         if page_number < 1 or page_number > self.total_pages:
             raise CorruptError(f"Page {page_number} out of range (total: {self.total_pages})")
 
         if page_number in self.cache:
             self._accessed(page_number)
             return self.cache[page_number].data
+
+        # Check WAL first (if in WAL mode)
+        if self.wal is not None and self.journal_mode == JournalMode.WAL:
+            wal_data = self.wal.read_page(page_number)
+            if wal_data is not None:
+                page = Page(page_number, wal_data)
+                self.cache[page_number] = page
+                self._accessed(page_number)
+                return page.data
 
         offset = (page_number - 1) * self.page_size
         data = self.vfs.read(self.handle, offset, self.page_size)
@@ -191,11 +300,22 @@ class Pager:
         return page.data
 
     def write_page(self, page_number: int, data: bytes):
-        """Mark a page as dirty (will be written to disk on flush).
+        """Mark a page as dirty or append to WAL.
 
         If in a transaction, the before-image is automatically journaled
         before the first modification to each page.
+        In WAL mode, writes go to the WAL file instead.
         """
+        if self.journal_mode == JournalMode.WAL and self.wal is not None:
+            self.wal.append_frame(page_number, data)
+            if page_number not in self.cache:
+                page = Page(page_number, data)
+                self.cache[page_number] = page
+            else:
+                self.cache[page_number].data = bytearray(data)
+            self.cache[page_number].dirty = True
+            self.dirty_pages.add(page_number)
+            return
         if self.in_transaction:
             self._journal_page(page_number)
         if page_number not in self.cache:
@@ -247,12 +367,25 @@ class Pager:
     # ---- rollback journal ----
 
     def begin_transaction(self, exclusive: bool = False):
-        """Begin a transaction. Saves before-images in the journal."""
+        """Begin a transaction. Saves before-images in the journal.
+
+        In WAL mode, no journal is created — writes go to the WAL file.
+        """
         if self.in_transaction:
             raise MisuseError("Already in a transaction")
 
         if self.journal_mode == JournalMode.OFF:
             self.in_transaction = True
+            return
+
+        if self.journal_mode == JournalMode.WAL:
+            if self.wal is None:
+                self.wal = WAL(self.vfs, self.handle.path, self.page_size)
+            lock = LOCK_EXCLUSIVE if exclusive else LOCK_RESERVED
+            if not self.vfs.lock(self.handle, lock):
+                raise BusyError("Database is locked")
+            self.in_transaction = True
+            self._before_images = {}
             return
 
         journal_path = self.handle.path + "-journal"
@@ -317,8 +450,29 @@ class Pager:
         self.vfs.write(self.journal_fd, 0, b'\x00' * JOURNAL_HEADER_SIZE)
 
     def commit_transaction(self):
-        """Commit all changes atomically."""
+        """Commit all changes atomically.
+
+        In WAL mode, the WAL file is synced and a checkpoint is NOT performed
+        here — checkpoint is triggered explicitly or when WAL grows large.
+        """
         if not self.in_transaction:
+            return
+
+        if self.journal_mode == JournalMode.WAL:
+            try:
+                self.flush()
+                self.vfs.sync(self.handle, SYNC_FULL)
+                if self.wal is not None:
+                    self.vfs.sync(self.wal.handle, SYNC_FULL)
+                self.file_change_counter += 1
+                self._write_header_field(24, self.file_change_counter.to_bytes(4, 'big'))
+            except Exception:
+                self._rollback_transaction()
+                raise
+            finally:
+                self.in_transaction = False
+                self._before_images = {}
+                self.vfs.unlock(self.handle, LOCK_SHARED)
             return
 
         try:
@@ -357,6 +511,18 @@ class Pager:
 
     def _rollback_transaction(self):
         if not self.in_transaction:
+            return
+        if self.journal_mode == JournalMode.WAL:
+            try:
+                self.dirty_pages.clear()
+                if self.wal is not None:
+                    self.wal.delete()
+                    self.wal = WAL(self.vfs, self.handle.path, self.page_size)
+            finally:
+                self.in_transaction = False
+                self._before_images = {}
+                self.cache.clear()
+                self.vfs.unlock(self.handle, LOCK_SHARED)
             return
         try:
             for page_number, original in self._before_images.items():
@@ -513,6 +679,18 @@ class Pager:
                 self.write_page(page_number, bytes(new_trunk_data))
                 self.freelist_trunk = page_number
 
+    # ---- checkpoint ----
+
+    def checkpoint(self):
+        """Checkpoint the WAL: merge WAL pages back to the database."""
+        if self.wal is not None and self.journal_mode == JournalMode.WAL:
+            if not self.vfs.lock(self.handle, LOCK_EXCLUSIVE):
+                raise BusyError("Cannot acquire exclusive lock for checkpoint")
+            try:
+                self.wal.checkpoint(self)
+            finally:
+                self.vfs.unlock(self.handle, LOCK_SHARED)
+
     # ---- close ----
 
     def close(self):
@@ -522,6 +700,8 @@ class Pager:
         if self.dirty_pages:
             self.flush()
             self.sync()
+        if self.wal is not None:
+            self.wal.close()
         self.cache.clear()
         self.dirty_pages.clear()
         self.vfs.close(self.handle)

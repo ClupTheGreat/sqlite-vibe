@@ -571,6 +571,11 @@ class Compiler:
                 self.cursor_table[cursor] = td
                 self.emit(Opcode.OpenRead, P1=cursor, P2=td.root_page,
                           P3=len(td.columns), comment=f'open {td.name}')
+                # Try index/PK seek optimization
+                if node.where and self._try_optimize_select(node, cursor, td):
+                    if node.compound_select:
+                        self._compile_compound(node)
+                    return
                 self.emit(Opcode.Rewind, P1=cursor, P2=len(self.instructions) + 4,
                           comment='rewind')
             elif isinstance(table_ref, SubqueryTable):
@@ -680,6 +685,72 @@ class Compiler:
         # Compound (UNION/INTERSECT/EXCEPT)
         if node.compound_select:
             self._compile_compound(node)
+
+    def _try_optimize_select(self, node: Select, cursor: int, td: TableDef) -> bool:
+        """Use PK seek for WHERE pk = value. Returns True if compiled."""
+        from pysqlite.ast import BinaryOp, ColumnRef, Literal, Parameter
+        where = node.where
+        if not isinstance(where, BinaryOp) or where.op not in ('=', '=='):
+            return False
+        col_ref = None
+        val_expr = None
+        if isinstance(where.left, ColumnRef) and not isinstance(where.right, ColumnRef):
+            col_ref, val_expr = where.left, where.right
+        elif isinstance(where.right, ColumnRef) and not isinstance(where.left, ColumnRef):
+            col_ref, val_expr = where.right, where.left
+        if col_ref is None or not isinstance(val_expr, (Literal, Parameter)):
+            return False
+        pk_cols = td.primary_key_columns()
+        is_pk = pk_cols and col_ref.name.upper() in ('ROWID', '_ROWID_', 'OID', pk_cols[0].upper())
+        if not is_pk:
+            return False
+        val_reg = self.compile_expr(val_expr, cursor)
+        not_found = self._label_name('opt_nf')
+        seek_idx = self.emit(Opcode.SeekRowid, P1=cursor, P2=0, P3=val_reg, comment='pk seek')
+        self._patch_jump(seek_idx, not_found)
+        self._current_select_columns = node.columns
+        col_regs = []
+        self.result_columns = []
+        for rc in node.columns:
+            if isinstance(rc.expr, StarExpr):
+                for i in range(len(getattr(td, 'columns', []))):
+                    col = td.columns[i] if hasattr(td, 'columns') and i < len(td.columns) else None
+                    self.result_columns.append(col.name if col else f'col{i}')
+                    if col and col.is_generated and col.generated_type == 'VIRTUAL' and col.generated_expr is not None:
+                        r = self.alloc_reg()
+                        col_regs.append(r)
+                        self._compile_expr_to(col.generated_expr, r, cursor)
+                    else:
+                        r = self.alloc_reg()
+                        col_regs.append(r)
+                        self.emit(Opcode.Column, P1=cursor, P2=i, P3=r, comment=f'column {i}')
+            else:
+                r = self.compile_expr(rc.expr, cursor)
+                col_regs.append(r)
+                if rc.alias:
+                    self.result_columns.append(rc.alias)
+                elif isinstance(rc.expr, ColumnRef):
+                    self.result_columns.append(rc.expr.name)
+                else:
+                    self.result_columns.append(f'col{len(self.result_columns)}')
+        if col_regs:
+            first_reg = min(col_regs)
+            n_cols = len(col_regs)
+            for i, reg in enumerate(col_regs):
+                if reg != first_reg + i:
+                    self.emit(Opcode.MemCopy, P1=reg, P2=first_reg + i, comment='compact')
+        else:
+            first_reg = 0
+            n_cols = 0
+        if node.order_by:
+            n_cols = self._compile_order_by(first_reg, n_cols, node.order_by, col_regs, cursor)
+            first_reg = min(col_regs) if col_regs else 0
+        self.emit(Opcode.ResultRow, P1=first_reg, P2=n_cols, comment='emit row')
+        end_label = self._label_name('opt_end')
+        self.emit_goto(end_label)
+        self.define_label(not_found)
+        self.define_label(end_label)
+        return True
 
     def _compile_aggregation(self, node: Select, cursor: int):
         self._expand_views(node)

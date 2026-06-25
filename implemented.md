@@ -23,7 +23,7 @@
 [x] 1.5 Hot journal recovery
 [x] 1.6 Freelist management (allocate, free, pop, push)
 [x] 1.7 Cache eviction (LRU)
-[ ] 1.8 WAL mode
+[x] 1.8 WAL mode (PRAGMA journal_mode=wal + checkpoint)
 ```
 
 ## Phase 2: Record & B-Tree Engine
@@ -63,7 +63,7 @@
 [x] 4.5 Query compiler — DELETE (scan + delete)
 [x] 4.6 Query compiler — DDL (CREATE/DROP TABLE/INDEX)
 [x] 4.7 Expression compiler (all expression types)
-[-] 4.8 Optimizer — index selection
+[x] 4.8 Optimizer — index selection (PK seek for WHERE pk = value)
 [-] 4.9 Optimizer — join ordering
 [x] 4.10 VM core (register system, dispatch loop)
 [x] 4.11 VM cursor operations
@@ -135,9 +135,9 @@
 [x] 9.1 Unit tests (13 test modules: bitwise, cell, btree, pager, record, schema, lexer, parser, compile, vm, vfs, transaction, errors)
 [x] 9.2 SQL integration tests (106 end-to-end + 11 compat tests)
 [x] 9.3 Compatibility tests (11 tests against real sqlite3)
-[ ] 9.4 Stress tests (large data, transactions)
-[ ] 9.5 Fuzz tests (random SQL, corrupt DB)
-[ ] 9.6 Regression tests
+[x] 9.4 Stress tests (large data, transactions) — tests/stress/test_stress.py
+[x] 9.5 Fuzz tests (random SQL, corrupt DB) — tests/fuzz/test_fuzz.py
+[x] 9.6 Regression tests — tests/regression/test_regression.py
 ```
 
 ## Phase 10: Performance
