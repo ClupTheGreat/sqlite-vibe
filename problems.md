@@ -315,6 +315,23 @@ When you encounter a problem during development, add an entry like:
     read column b from the main table cursor instead of the EXCLUDED table
     cursor. Fixed by adding _cursor_for_table helper that searches cursor_table
     for the named table, falling back to the default cursor if not found.
+
+[2026-06-25] Subtract always returned float even when both operands were int
+  - File: pysqlite/vm.py:557-560 (fixed)
+  - Severity: medium
+  - Details: _op_Subtract always converted both operands to float before
+    subtracting, producing float results even for int-int subtraction (e.g.,
+    0 - 5 returned -5.0 instead of -5). This propagated to ABS(-5) returning
+    5.0. Fixed by checking if both operands are int and using integer arithmetic.
+
+[2026-06-25] Non-contiguous column registers caused wrong multi-column results
+  - File: pysqlite/compile.py:726, 592 (fixed)
+  - Severity: high
+  - Details: When compiling SELECT with multiple expressions (e.g., SELECT
+    LENGTH('hello'), UPPER('hello')), each expression allocates intermediate
+    registers between column results. ResultRow assumed registers were
+    contiguous starting from min(col_regs). Fixed by adding MemCopy compaction
+    to make column registers contiguous before ResultRow.
 ```
 
 
