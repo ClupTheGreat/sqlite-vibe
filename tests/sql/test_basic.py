@@ -561,6 +561,28 @@ class TestUpsert:
         assert res == [[1, 'hello'], [2, 'world'], [3, 'new']]
 
 
+    def test_on_conflict_do_update_excluded(self, db):
+        db.execute('CREATE TABLE t (a INT PRIMARY KEY, b TEXT)')
+        db.execute("INSERT INTO t VALUES (1, 'hello')")
+        db.execute("INSERT INTO t VALUES (1, 'world') ON CONFLICT DO UPDATE SET b = excluded.b")
+        res = db.execute('SELECT * FROM t ORDER BY a')
+        assert res == [[1, 'world']]
+
+    def test_on_conflict_do_update_literal(self, db):
+        db.execute('CREATE TABLE t (a INT PRIMARY KEY, b TEXT)')
+        db.execute("INSERT INTO t VALUES (1, 'hello')")
+        db.execute("INSERT INTO t VALUES (1, 'ignored') ON CONFLICT DO UPDATE SET b = 'bar'")
+        res = db.execute('SELECT * FROM t ORDER BY a')
+        assert res == [[1, 'bar']]
+
+    def test_on_conflict_do_update_no_conflict(self, db):
+        db.execute('CREATE TABLE t (a INT PRIMARY KEY, b TEXT)')
+        db.execute("INSERT INTO t VALUES (1, 'hello')")
+        db.execute("INSERT INTO t VALUES (2, 'new') ON CONFLICT DO UPDATE SET b = excluded.b")
+        res = db.execute('SELECT * FROM t ORDER BY a')
+        assert res == [[1, 'hello'], [2, 'new']]
+
+
 class TestParameterBinding:
     def test_named_param(self, db):
         db.execute('CREATE TABLE t (a INT, b TEXT)')

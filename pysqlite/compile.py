@@ -252,9 +252,13 @@ class Compiler:
                       comment=f'param {pname}')
 
         elif isinstance(expr, ColumnRef):
-            table_def = self._lookup_table(cursor)
+            if expr.table:
+                ref_cursor = self._cursor_for_table(expr.table, cursor)
+            else:
+                ref_cursor = cursor
+            table_def = self._lookup_table(ref_cursor)
             col_idx = self._column_index(table_def, expr.name)
-            self.emit(Opcode.Column, P1=cursor, P2=col_idx, P3=reg,
+            self.emit(Opcode.Column, P1=ref_cursor, P2=col_idx, P3=reg,
                       comment=f'column {expr.name}')
 
         elif isinstance(expr, UnaryOp):
@@ -799,10 +803,68 @@ class Compiler:
                 record_reg = self.alloc_reg()
                 self.emit(Opcode.MakeRecord, P1=first_val, P2=len(val_regs),
                           P3=record_reg, comment='make record')
-                use_no_conflict = (node.on_conflict is not None and node.on_conflict.action == 'NOTHING') or node.or_action == 'IGNORE'
-                if use_no_conflict:
+                do_update = node.on_conflict is not None and node.on_conflict.action == 'UPDATE'
+                do_nothing = (node.on_conflict is not None and node.on_conflict.action == 'NOTHING') or node.or_action == 'IGNORE'
+                if do_nothing:
                     self.emit(Opcode.NoConflictInsert, P1=cursor, P2=record_reg, P3=rowid_reg,
                               comment='insert or ignore')
+                elif do_update:
+                    # SeekRowid P2=jump if NOT found (no conflict → normal insert)
+                    no_conflict_label = self._label_name('upsert_no_conflict')
+                    idx = self.emit(Opcode.SeekRowid, P1=cursor, P2=0, P3=rowid_reg,
+                                   comment='seek for conflict; jump if not found')
+                    self._patch_jump(idx, no_conflict_label)
+                    # --- DO UPDATE (conflict found) ---
+                    # Open ephemeral for EXCLUDED values
+                    excluded_cursor = self.alloc_cursor()
+                    from pysqlite.schema import AFFINITY as _AFF
+                    excluded_cols = [ColumnDef(name=c.name, affinity=_AFF.BLOB) for c in td.columns]
+                    excluded_td = TableDef(name='EXCLUDED', columns=excluded_cols, root_page=0, sql='')
+                    self.cursor_table[excluded_cursor] = excluded_td
+                    self.emit(Opcode.OpenEphemeral, P1=excluded_cursor, P2=1, comment='EXCLUDED')
+                    excl_rowid = self.alloc_reg()
+                    self.emit(Opcode.Integer, P1=0, P2=excl_rowid, comment='excluded rowid')
+                    self.emit(Opcode.MakeRecord, P1=first_val, P2=len(val_regs),
+                              P3=record_reg, comment='EXCLUDED record')
+                    self.emit(Opcode.Insert, P1=excluded_cursor, P2=record_reg, P3=excl_rowid,
+                              comment='insert into EXCLUDED')
+                    self.emit(Opcode.Rewind, P1=excluded_cursor, P2=0, comment='rewind EXCLUDED')
+                    # Build updated row
+                    upd_rowid = self.alloc_reg()
+                    self.emit(Opcode.Rowid, P1=cursor, P2=upd_rowid, comment='existing rowid')
+                    n_cols = len(td.columns)
+                    upd_regs = []
+                    for ci in range(n_cols):
+                        r = self.alloc_reg()
+                        self.emit(Opcode.Column, P1=cursor, P2=ci, P3=r, comment=f'read col {ci}')
+                        upd_regs.append(r)
+                    for sc in node.on_conflict.set_clauses:
+                        col_idx = -1
+                        try:
+                            col_idx = td.column_index(sc.column)
+                        except ValueError:
+                            col_idx = -1
+                        if col_idx >= 0:
+                            set_reg = self.compile_expr(sc.expr, excluded_cursor)
+                            if set_reg != upd_regs[col_idx]:
+                                self.emit(Opcode.MemCopy, P1=set_reg, P2=upd_regs[col_idx],
+                                          comment=f'set {sc.column}')
+                    self.emit(Opcode.Delete, P1=cursor, comment='delete old row')
+                    first_upd = upd_regs[0] if upd_regs else self.reg_null
+                    upd_rec_reg = self.alloc_reg()
+                    self.emit(Opcode.MakeRecord, P1=first_upd, P2=len(upd_regs),
+                              P3=upd_rec_reg, comment='update record')
+                    self.emit(Opcode.Insert, P1=cursor, P2=upd_rec_reg, P3=upd_rowid,
+                              comment='insert updated row')
+                    after_update_label = self._label_name('upsert_after')
+                    self.emit_goto(after_update_label)
+                    # --- Normal insert (no conflict) ---
+                    self.define_label(no_conflict_label)
+                    self.emit(Opcode.MakeRecord, P1=first_val, P2=len(val_regs),
+                              P3=record_reg, comment='make record')
+                    self.emit(Opcode.Insert, P1=cursor, P2=record_reg, P3=rowid_reg,
+                              comment='insert row')
+                    self.define_label(after_update_label)
                 else:
                     self.emit(Opcode.Insert, P1=cursor, P2=record_reg, P3=rowid_reg,
                               comment='insert row')
@@ -1543,6 +1605,13 @@ class Compiler:
 
     def _lookup_table(self, cursor: int) -> TableDef | None:
         return self.cursor_table.get(cursor)
+
+    def _cursor_for_table(self, name: str, default: int = 0) -> int:
+        name_upper = name.upper()
+        for c, td in self.cursor_table.items():
+            if td and td.name.upper() == name_upper:
+                return c
+        return default
 
     def _lookup_table_def(self, name: str, schema: str | None = None) -> TableDef:
         if self.schema is not None and hasattr(self.schema, 'get_table'):
