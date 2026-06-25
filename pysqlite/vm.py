@@ -897,6 +897,9 @@ class VM:
             return random.random() * 2 - 1
         if name_upper in ('DATE', 'TIME', 'DATETIME', 'JULIANDAY', 'STRFTIME', 'UNIXEPOCH'):
             return self._call_datetime(name_upper, args)
+        json_result = self._call_json_function(name_upper, args)
+        if json_result is not NotImplemented:
+            return json_result
         if not args:
             return None
         return args[0]
@@ -1036,6 +1039,138 @@ class VM:
             return int((dt - datetime(1970, 1, 1)).total_seconds())
         return None
 
+    def _call_json_function(self, name: str, args: list) -> Any:
+        import json as _json
+        from pysqlite.jsonpath import (
+            parse_path, evaluate_path, json_path_extract, json_path_set,
+            json_path_remove, json_type_of, json_array_length_of,
+        )
+        name_upper = name.upper()
+        if not name_upper.startswith('JSON'):
+            return NotImplemented
+        if name_upper == 'JSON':
+            if not args or args[0] is None:
+                return None
+            s = str(args[0])
+            try:
+                parsed = _json.loads(s)
+                return _json.dumps(parsed, separators=(',', ':'))
+            except (_json.JSONDecodeError, ValueError):
+                return None
+        if name_upper == 'JSON_VALID':
+            if not args or args[0] is None:
+                return 0
+            s = str(args[0])
+            try:
+                _json.loads(s)
+                return 1
+            except (_json.JSONDecodeError, ValueError):
+                return 0
+        if name_upper == 'JSON_TYPE':
+            if not args or args[0] is None:
+                return None
+            s = str(args[0])
+            path = args[1] if len(args) > 1 else '$'
+            try:
+                parsed = _json.loads(s)
+                return json_type_of(parsed, str(path))
+            except (_json.JSONDecodeError, ValueError):
+                return None
+        if name_upper == 'JSON_ARRAY_LENGTH':
+            if not args or args[0] is None:
+                return None
+            s = str(args[0])
+            path = args[1] if len(args) > 1 else '$'
+            try:
+                parsed = _json.loads(s)
+                return json_array_length_of(parsed, str(path))
+            except (_json.JSONDecodeError, ValueError):
+                return None
+        if name_upper == 'JSON_EXTRACT':
+            if not args or args[0] is None:
+                return None
+            s = str(args[0])
+            for path_arg in args[1:]:
+                if path_arg is None:
+                    continue
+                try:
+                    parsed = _json.loads(s)
+                    val = json_path_extract(parsed, str(path_arg))
+                    if val is not None:
+                        return val
+                except (_json.JSONDecodeError, ValueError):
+                    pass
+            return None
+        if name_upper == 'JSON_ARRAY':
+            items = list(args)
+            return _json.dumps(items, separators=(',', ':'))
+        if name_upper == 'JSON_OBJECT':
+            if len(args) % 2 != 0:
+                return None
+            obj = {}
+            for i in range(0, len(args), 2):
+                key = str(args[i]) if args[i] is not None else None
+                if key is not None:
+                    obj[key] = args[i + 1]
+            return _json.dumps(obj, separators=(',', ':'))
+        if name_upper == 'JSON_SET':
+            if len(args) < 3:
+                return args[0] if args else None
+            s = str(args[0])
+            try:
+                parsed = _json.loads(s)
+                current = parsed
+                for i in range(1, len(args), 2):
+                    path = str(args[i]) if args[i] is not None else ''
+                    val = args[i + 1] if i + 1 < len(args) else None
+                    current = json_path_set(current, path, val, mode='set')
+                return _json.dumps(current, separators=(',', ':'))
+            except (_json.JSONDecodeError, ValueError):
+                return None
+        if name_upper == 'JSON_INSERT':
+            if len(args) < 3:
+                return args[0] if args else None
+            s = str(args[0])
+            try:
+                parsed = _json.loads(s)
+                current = parsed
+                for i in range(1, len(args), 2):
+                    path = str(args[i]) if args[i] is not None else ''
+                    val = args[i + 1] if i + 1 < len(args) else None
+                    current = json_path_set(current, path, val, mode='insert')
+                return _json.dumps(current, separators=(',', ':'))
+            except (_json.JSONDecodeError, ValueError):
+                return None
+        if name_upper == 'JSON_REPLACE':
+            if len(args) < 3:
+                return args[0] if args else None
+            s = str(args[0])
+            try:
+                parsed = _json.loads(s)
+                current = parsed
+                for i in range(1, len(args), 2):
+                    path = str(args[i]) if args[i] is not None else ''
+                    val = args[i + 1] if i + 1 < len(args) else None
+                    current = json_path_set(current, path, val, mode='replace')
+                return _json.dumps(current, separators=(',', ':'))
+            except (_json.JSONDecodeError, ValueError):
+                return None
+        if name_upper == 'JSON_REMOVE':
+            if len(args) < 2:
+                return args[0] if args else None
+            s = str(args[0])
+            try:
+                parsed = _json.loads(s)
+                current = parsed
+                for path_arg in args[1:]:
+                    if path_arg is None:
+                        continue
+                    current = json_path_remove(current, str(path_arg))
+                return _json.dumps(current, separators=(',', ':'))
+            except (_json.JSONDecodeError, ValueError):
+                return None
+        return NotImplemented
+
     # ── EXPLAIN ──
 
     def _op_Explain(self, P1: int, P2: int, P3: int, P4: Any, P5: int):
@@ -1108,6 +1243,19 @@ class VM:
             separator = acc[0][1] if acc and len(acc[0]) > 1 else ','
             values = [str(args[0]) for args in acc if args]
             result = separator.join(values)
+        elif name_upper == 'JSON_GROUP_ARRAY':
+            import json as _json
+            items = [args[0] for args in acc if args]
+            result = _json.dumps(items, separators=(',', ':'))
+        elif name_upper == 'JSON_GROUP_OBJECT':
+            import json as _json
+            obj = {}
+            for args in acc:
+                if args and len(args) >= 2:
+                    key = str(args[0]) if args[0] is not None else None
+                    if key is not None:
+                        obj[key] = args[1]
+            result = _json.dumps(obj, separators=(',', ':'))
         else:
             result = len(acc)
         self._set_reg(P3, make_register(result))
@@ -1196,9 +1344,15 @@ class VM:
                     vals = [None] * len(grp)
                 else:
                     arg_start = agg.get('arg_start', col)
+                    n_args = agg.get('n_args', 1)
                     for row in grp:
-                        v = row[arg_start] if arg_start < len(row) else None
-                        vals.append(v)
+                        if n_args <= 1:
+                            v = row[arg_start] if arg_start < len(row) else None
+                            vals.append(v)
+                        else:
+                            pair = tuple(row[arg_start + i] if arg_start + i < len(row) else None
+                                         for i in range(n_args))
+                            vals.append(pair)
                 if distinct:
                     seen = set()
                     uniq = []
@@ -1329,11 +1483,27 @@ class VM:
             non_null = [v for v in values if v is not None]
             return max(non_null) if non_null else None
         elif name_upper == 'GROUP_CONCAT':
-            if star:
-                non_null = [str(v) for v in values]
+            separator = ','
+            if values and isinstance(values[0], tuple):
+                items = [str(v[0]) for v in values if v[0] is not None]
+                if values[0] and len(values[0]) > 1 and values[0][1] is not None:
+                    separator = str(values[0][1])
             else:
-                non_null = [str(v) for v in values if v is not None]
-            return ','.join(non_null) if non_null else None
+                items = [str(v) for v in values if v is not None]
+            return separator.join(items) if items else None
+        elif name_upper == 'JSON_GROUP_ARRAY':
+            import json as _json
+            items = [v for v in values if v is not None]
+            return _json.dumps(items, separators=(',', ':'))
+        elif name_upper == 'JSON_GROUP_OBJECT':
+            import json as _json
+            obj = {}
+            for v in values:
+                if isinstance(v, tuple) and len(v) >= 2:
+                    key = str(v[0]) if v[0] is not None else None
+                    if key is not None:
+                        obj[key] = v[1]
+            return _json.dumps(obj, separators=(',', ':')) if obj else '{}'
         return len(values)
 
     def _op_Noop(self, P1: int, P2: int, P3: int, P4: Any, P5: int):

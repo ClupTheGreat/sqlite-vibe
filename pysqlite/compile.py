@@ -24,7 +24,7 @@ from pysqlite.ast import (
 )
 
 
-AGGREGATE_FUNCTIONS = frozenset({'COUNT', 'SUM', 'AVG', 'MIN', 'MAX', 'GROUP_CONCAT', 'TOTAL'})
+AGGREGATE_FUNCTIONS = frozenset({'COUNT', 'SUM', 'AVG', 'MIN', 'MAX', 'GROUP_CONCAT', 'TOTAL', 'JSON_GROUP_ARRAY', 'JSON_GROUP_OBJECT'})
 
 def _is_aggregate_name(name: str, custom_aggregates: set[str] | None = None) -> bool:
     return name.upper() in AGGREGATE_FUNCTIONS or (
