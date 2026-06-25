@@ -193,6 +193,7 @@ class ColumnDef:
 class ForeignKey:
     table: str
     columns: list[str] = field(default_factory=list)
+    parent_columns: list[str] = field(default_factory=list)
     actions: dict[str, str] = field(default_factory=dict)
     match: str | None = None
     deferrable: bool = False

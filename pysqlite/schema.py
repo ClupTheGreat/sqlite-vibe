@@ -342,7 +342,10 @@ class Schema:
             for cc in col_def.constraints:
                 if cc.kind == 'REFERENCES' and cc.details:
                     fk = cc.details
-                    if not fk.columns:
+                    if fk.columns:
+                        fk.parent_columns = list(fk.columns)
+                        fk.columns = [col_def.name]
+                    else:
                         fk.columns = [col_def.name]
                     fk_list.append(fk)
         return TableDef(

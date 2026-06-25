@@ -314,17 +314,19 @@ class Parser:
                                TokenType.NOT):
             if self.match(TokenType.ON):
                 action = self.expect_any(TokenType.DELETE, TokenType.UPDATE).value
-                self.match(TokenType.SET)
-                self.match(TokenType.NULL)
-                if self.peek() == TokenType.CASCADE:
+                if self.match(TokenType.CASCADE):
                     actions[action] = 'CASCADE'
-                elif self.peek() == TokenType.RESTRICT:
+                elif self.match(TokenType.RESTRICT):
                     actions[action] = 'RESTRICT'
-                elif self.peek() == TokenType.SET_NULL:
-                    actions[action] = 'SET NULL'
-                elif self.peek() == TokenType.SET_DEFAULT:
-                    actions[action] = 'SET DEFAULT'
+                elif self.match(TokenType.SET):
+                    if self.match(TokenType.NULL):
+                        actions[action] = 'SET NULL'
+                    elif self.match(TokenType.DEFAULT):
+                        actions[action] = 'SET DEFAULT'
+                    else:
+                        raise ParseError("Expected NULL or DEFAULT after SET")
                 elif self.peek() == TokenType.NOTHING:
+                    self.advance()
                     actions[action] = 'NO ACTION'
                 else:
                     actions[action] = self.advance().value
@@ -369,6 +371,7 @@ class Parser:
             self.expect(TokenType.RPAREN)
             self.expect(TokenType.REFERENCES)
             fk = self._parse_foreign_key()
+            fk.parent_columns = list(fk.columns)
             fk.columns = cols
             return TableConstraint(name=name, kind='FOREIGN KEY', details=fk)
         raise ParseError("Expected table constraint")

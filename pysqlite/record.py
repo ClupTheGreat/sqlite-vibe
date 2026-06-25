@@ -181,3 +181,9 @@ class Record:
     def get_values(self) -> list:
         """Return just the Python values without serial type info."""
         return [v for _, v in self.columns]
+
+    @staticmethod
+    def encode_from_values(values: list) -> bytes:
+        """Encode a list of Python values directly into a record byte string."""
+        columns = [(Record.serial_type(v), v) for v in values]
+        return Record(columns).encode()

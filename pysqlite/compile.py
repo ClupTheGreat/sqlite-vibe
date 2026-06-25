@@ -1138,7 +1138,10 @@ class Compiler:
             for c in col.constraints:
                 if c.kind == 'REFERENCES' and isinstance(c.details, AstForeignKey):
                     fk = c.details
-                    if not fk.columns:
+                    if fk.columns:
+                        fk.parent_columns = list(fk.columns)
+                        fk.columns = [col.name]
+                    else:
                         fk.columns = [col.name]
                     foreign_keys.append(fk)
         for tc in node.constraints:
@@ -1183,14 +1186,18 @@ class Compiler:
                 elif c.kind == 'REFERENCES' and hasattr(c, 'details') and c.details:
                     fk = c.details
                     col_sql += f' REFERENCES {fk.table}'
-                    if fk.columns:
+                    if fk.parent_columns:
+                        col_sql += f' ({", ".join(fk.parent_columns)})'
+                    elif len(fk.columns) > 1 or (len(fk.columns) == 1 and fk.columns[0] != col.name):
                         col_sql += f' ({", ".join(fk.columns)})'
             col_parts.append(col_sql)
         for tc in node.constraints:
             if tc.kind == 'FOREIGN KEY' and hasattr(tc, 'details') and tc.details:
                 fk = tc.details
                 fk_sql = f'FOREIGN KEY ({", ".join(tc.columns)}) REFERENCES {fk.table}'
-                if fk.columns:
+                if fk.parent_columns:
+                    fk_sql += f' ({", ".join(fk.parent_columns)})'
+                elif fk.columns:
                     fk_sql += f' ({", ".join(fk.columns)})'
                 col_parts.append(fk_sql)
         parts.append(', '.join(col_parts))

@@ -89,8 +89,8 @@
 [x] 6.1 Transaction manager (BEGIN/COMMIT/ROLLBACK)
 [x] 6.2 Lock protocol (5-state)
 [x] 6.3 Savepoints (nested, rollback to, release)
-[-] 6.4 Foreign key enforcement (immediate/deferred)
-[ ] 6.5 CASCADE / SET NULL / SET DEFAULT / RESTRICT
+[x] 6.4 Foreign key enforcement (immediate/deferred)
+[x] 6.5 CASCADE / SET NULL / SET DEFAULT / RESTRICT (ON DELETE; ON UPDATE not yet enforced)
 [x] 6.6 Busy handler (busy_handler, busy_timeout)
 ```
 
